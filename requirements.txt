@@ -1,0 +1,4 @@
+python-telegram-bot==20.7
+anthropic>=0.34.0
+supabase>=2.0.0
+tavily-python>=0.3.0
