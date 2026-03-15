@@ -1,5 +1,5 @@
 import os
-import json
+import asyncio
 import logging
 from datetime import datetime
 
@@ -17,16 +17,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Environment variables ─────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-SUPABASE_URL     = os.environ["SUPABASE_URL"]
-SUPABASE_KEY     = os.environ["SUPABASE_KEY"]
-TAVILY_API_KEY   = os.environ["TAVILY_API_KEY"]
+SUPABASE_URL      = os.environ["SUPABASE_URL"]
+SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
+TAVILY_API_KEY    = os.environ["TAVILY_API_KEY"]
 
 # ── Clients ───────────────────────────────────────────────────────────────────
-claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-db      = create_client(SUPABASE_URL, SUPABASE_KEY)
-tavily  = TavilyClient(api_key=TAVILY_API_KEY)
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+db     = create_client(SUPABASE_URL, SUPABASE_KEY)
+tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are Jay's personal AI assistant. Jay is a young adult who works as an automotive and light diesel mechanic doing side jobs, and he is studying Economics at Texas Tech University. His long-term goal is to open his own mechanic shop.
@@ -60,15 +60,15 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "customer_name":    {"type": "string",  "description": "Customer's full name"},
-                "customer_phone":   {"type": "string",  "description": "Customer's phone number"},
-                "vehicle_year":     {"type": "string",  "description": "Year of the vehicle"},
-                "vehicle_make":     {"type": "string",  "description": "Make of the vehicle (e.g. Ford, Chevy, Toyota)"},
-                "vehicle_model":    {"type": "string",  "description": "Model of the vehicle"},
-                "job_description":  {"type": "string",  "description": "What work is being done"},
-                "parts_used":       {"type": "string",  "description": "Parts used or needed for the job"},
-                "cost":             {"type": "number",  "description": "Total cost charged to the customer"},
-                "status":           {"type": "string",  "description": "Job status: pending, in_progress, waiting_parts, or completed"},
+                "customer_name":   {"type": "string",  "description": "Customer's full name"},
+                "customer_phone":  {"type": "string",  "description": "Customer's phone number"},
+                "vehicle_year":    {"type": "string",  "description": "Year of the vehicle"},
+                "vehicle_make":    {"type": "string",  "description": "Make of the vehicle (e.g. Ford, Chevy, Toyota)"},
+                "vehicle_model":   {"type": "string",  "description": "Model of the vehicle"},
+                "job_description": {"type": "string",  "description": "What work is being done"},
+                "parts_used":      {"type": "string",  "description": "Parts used or needed for the job"},
+                "cost":            {"type": "number",  "description": "Total cost charged to the customer"},
+                "status":          {"type": "string",  "description": "Job status: pending, in_progress, waiting_parts, or completed"},
             },
             "required": ["customer_name", "job_description"],
         },
@@ -79,18 +79,18 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "job_id":           {"type": "integer", "description": "The ID number of the job to update"},
-                "customer_name":    {"type": "string"},
-                "customer_phone":   {"type": "string"},
-                "vehicle_year":     {"type": "string"},
-                "vehicle_make":     {"type": "string"},
-                "vehicle_model":    {"type": "string"},
-                "job_description":  {"type": "string"},
-                "parts_used":       {"type": "string"},
-                "cost":             {"type": "number"},
-                "paid":             {"type": "boolean"},
-                "status":           {"type": "string"},
-                "notes":            {"type": "string"},
+                "job_id":          {"type": "integer", "description": "The ID number of the job to update"},
+                "customer_name":   {"type": "string"},
+                "customer_phone":  {"type": "string"},
+                "vehicle_year":    {"type": "string"},
+                "vehicle_make":    {"type": "string"},
+                "vehicle_model":   {"type": "string"},
+                "job_description": {"type": "string"},
+                "parts_used":      {"type": "string"},
+                "cost":            {"type": "number"},
+                "paid":            {"type": "boolean"},
+                "status":          {"type": "string"},
+                "notes":           {"type": "string"},
             },
             "required": ["job_id"],
         },
@@ -242,7 +242,7 @@ def run_tool(name: str, inputs: dict) -> str:
     if name == "recall_memory":
         try:
             query = inputs["query"].lower()
-            mems = db.table("memory").select("*").execute()
+            mems   = db.table("memory").select("*").execute()
             convos = (
                 db.table("conversations")
                 .select("*")
@@ -266,7 +266,7 @@ def run_tool(name: str, inputs: dict) -> str:
     return f"Unknown tool: {name}"
 
 
-# ── Conversation history ──────────────────────────────────────────────────────
+# ── Conversation helpers ───────────────────────────────────────────────────────
 def get_history(limit: int = 20) -> list:
     try:
         res = db.table("conversations").select("*").order("timestamp", desc=True).limit(limit).execute()
@@ -290,14 +290,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_message("user", user_text)
 
     history = get_history(limit=20)
-    # Drop the message we just saved to avoid duplicate
     if history and history[-1]["role"] == "user" and history[-1]["content"] == user_text:
         history = history[:-1]
 
     messages = history + [{"role": "user", "content": user_text}]
-    system = SYSTEM_PROMPT.format(datetime=datetime.now().strftime("%A, %B %d, %Y at %I:%M %p"))
+    system   = SYSTEM_PROMPT.format(datetime=datetime.now().strftime("%A, %B %d, %Y at %I:%M %p"))
 
-    # Agentic loop
     for _ in range(10):
         response = claude.messages.create(
             model="claude-sonnet-4-6",
@@ -320,11 +318,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "content": result,
                     })
             messages.append({"role": "user", "content": tool_results})
-
         else:
             final = "".join(b.text for b in response.content if hasattr(b, "text"))
             save_message("assistant", final)
-            # Send (split if over Telegram's limit)
             for i in range(0, max(len(final), 1), 4096):
                 await update.message.reply_text(final[i : i + 4096])
             break
@@ -339,13 +335,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
+async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await asyncio.Event().wait()  # Run forever
+        await app.updater.stop()
+        await app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
