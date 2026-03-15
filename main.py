@@ -17,12 +17,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Environment variables ─────────────────────────────────────────────────────
-TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-SUPABASE_URL      = os.environ["SUPABASE_URL"]
-SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
-TAVILY_API_KEY    = os.environ["TAVILY_API_KEY"]
-
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"].strip()
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"].strip()
+SUPABASE_URL      = os.environ["SUPABASE_URL"].strip()
+SUPABASE_KEY      = os.environ["SUPABASE_KEY"].strip()
+TAVILY_API_KEY    = os.environ["TAVILY_API_KEY"].strip()
 # ── Clients ───────────────────────────────────────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 db     = create_client(SUPABASE_URL, SUPABASE_KEY)
