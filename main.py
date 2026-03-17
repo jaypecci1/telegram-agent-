@@ -2,7 +2,12 @@ import os
 import asyncio
 import logging
 import httpx
+import time
+import base64
 from datetime import datetime
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
 
 import anthropic
 from telegram import Update
@@ -23,7 +28,8 @@ ANTHROPIC_API_KEY = "".join(os.environ["ANTHROPIC_API_KEY"].split())
 SUPABASE_URL      = os.environ["SUPABASE_URL"].strip()
 SUPABASE_KEY      = os.environ["SUPABASE_KEY"].strip()
 TAVILY_API_KEY    = "".join(os.environ["TAVILY_API_KEY"].split())
-KALSHI_API_KEY    = "".join(os.environ.get("KALSHI_API_KEY", "").split())
+KALSHI_API_KEY        = "".join(os.environ.get("KALSHI_API_KEY", "").split())
+KALSHI_PRIVATE_KEY_B64 = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
 
 # ── Clients ───────────────────────────────────────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -66,19 +72,34 @@ Personality: Be conversational and friendly. Talk to Jay like a smart assistant 
 Current date and time: {datetime}"""
 
 # ── Kalshi API helpers ────────────────────────────────────────────────────────
-def kalshi_headers():
-    return {
-        "Authorization": f"Bearer {KALSHI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+def sign_kalshi_request(method: str, path: str) -> dict:
+    """Generate signed headers for Kalshi API requests."""
+    try:
+        timestamp = str(int(time.time() * 1000))
+        message   = f"{timestamp}{method}{path}"
+        pem       = base64.b64decode(KALSHI_PRIVATE_KEY_B64).decode()
+        private_key = serialization.load_pem_private_key(
+            pem.encode(), password=None, backend=default_backend()
+        )
+        signature = private_key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256())
+        sig_b64   = base64.b64encode(signature).decode()
+        return {
+            "KALSHI-ACCESS-KEY":       KALSHI_API_KEY,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": sig_b64,
+            "Content-Type":            "application/json",
+        }
+    except Exception as e:
+        logger.error(f"Kalshi signing error: {e}")
+        return {"Content-Type": "application/json"}
 
 def get_kalshi_balance() -> dict:
     try:
+        path = "/trade-api/v2/portfolio/balance"
         with httpx.Client() as client:
-            r = client.get(f"{KALSHI_BASE_URL}/portfolio/balance", headers=kalshi_headers(), timeout=10)
+            r = client.get(f"{KALSHI_BASE_URL}/portfolio/balance", headers=sign_kalshi_request("GET", path), timeout=10)
             if r.status_code == 200:
-                data = r.json()
-                balance = data.get("balance", 0) / 100
+                balance = r.json().get("balance", 0) / 100
                 return {"success": True, "balance": balance}
             return {"success": False, "error": r.text}
     except Exception as e:
@@ -86,10 +107,11 @@ def get_kalshi_balance() -> dict:
 
 def get_kalshi_markets(limit: int = 100) -> dict:
     try:
+        path = "/trade-api/v2/markets"
         with httpx.Client() as client:
             r = client.get(
                 f"{KALSHI_BASE_URL}/markets",
-                headers=kalshi_headers(),
+                headers=sign_kalshi_request("GET", path),
                 params={"limit": limit, "status": "open"},
                 timeout=15,
             )
@@ -101,8 +123,9 @@ def get_kalshi_markets(limit: int = 100) -> dict:
 
 def get_kalshi_market(ticker: str) -> dict:
     try:
+        path = f"/trade-api/v2/markets/{ticker}"
         with httpx.Client() as client:
-            r = client.get(f"{KALSHI_BASE_URL}/markets/{ticker}", headers=kalshi_headers(), timeout=10)
+            r = client.get(f"{KALSHI_BASE_URL}/markets/{ticker}", headers=sign_kalshi_request("GET", path), timeout=10)
             if r.status_code == 200:
                 return {"success": True, "market": r.json().get("market", {})}
             return {"success": False, "error": r.text}
@@ -111,8 +134,9 @@ def get_kalshi_market(ticker: str) -> dict:
 
 def get_kalshi_positions() -> dict:
     try:
+        path = "/trade-api/v2/portfolio/positions"
         with httpx.Client() as client:
-            r = client.get(f"{KALSHI_BASE_URL}/portfolio/positions", headers=kalshi_headers(), timeout=10)
+            r = client.get(f"{KALSHI_BASE_URL}/portfolio/positions", headers=sign_kalshi_request("GET", path), timeout=10)
             if r.status_code == 200:
                 return {"success": True, "positions": r.json().get("market_positions", [])}
             return {"success": False, "error": r.text}
@@ -121,6 +145,7 @@ def get_kalshi_positions() -> dict:
 
 def place_kalshi_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
     try:
+        path = "/trade-api/v2/portfolio/orders"
         payload = {
             "ticker": ticker,
             "action": "buy",
@@ -132,13 +157,12 @@ def place_kalshi_order(ticker: str, side: str, price_cents: int, count: int) -> 
         with httpx.Client() as client:
             r = client.post(
                 f"{KALSHI_BASE_URL}/portfolio/orders",
-                headers=kalshi_headers(),
+                headers=sign_kalshi_request("POST", path),
                 json=payload,
                 timeout=15,
             )
             if r.status_code in (200, 201):
-                order = r.json().get("order", {})
-                return {"success": True, "order": order}
+                return {"success": True, "order": r.json().get("order", {})}
             return {"success": False, "error": r.text}
     except Exception as e:
         return {"success": False, "error": str(e)}
