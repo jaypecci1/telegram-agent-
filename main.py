@@ -57,7 +57,7 @@ def get_kalshi_token() -> str:
         return ""
 
 # ── Trading Config ────────────────────────────────────────────────────────────
-KALSHI_BASE_URL         = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
 MAX_PER_TRADE           = 2.50    # Max $ per trade
 MAX_TOTAL_EXPOSURE      = 20.00   # Max $ in open positions at once
 MIN_EDGE                = 0.08    # Min edge (8%) to consider a trade
