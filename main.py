@@ -768,7 +768,7 @@ async def main():
     async with app:
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        if KALSHI_API_KEY:
+        if KALSHI_EMAIL:
             asyncio.create_task(autonomous_scanner(app))
             logger.info("Kalshi autonomous scanner started.")
         await asyncio.Event().wait()
