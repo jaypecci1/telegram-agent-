@@ -72,50 +72,19 @@ Personality: Be conversational and friendly. Talk to Jay like a smart assistant 
 Current date and time: {datetime}"""
 
 # ── Kalshi API helpers ────────────────────────────────────────────────────────
-def load_kalshi_private_key():
-    """Load the Kalshi private key, trying multiple formats."""
-    raw = base64.b64decode(KALSHI_PRIVATE_KEY_B64)
-
-    # Attempt 1: Load PEM as-is (works for both PKCS#1 and PKCS#8 with correct headers)
-    try:
-        return serialization.load_pem_private_key(raw, password=None, backend=default_backend())
-    except Exception as e1:
-        logger.warning(f"PEM load attempt 1 failed: {e1}")
-
-    # Attempt 2: Key may be PKCS#8 DER wrapped in wrong PKCS#1 PEM headers — swap headers
-    try:
-        pem_str = raw.decode()
-        pem_pkcs8 = pem_str.replace(
-            "-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----"
-        ).replace(
-            "-----END RSA PRIVATE KEY-----", "-----END PRIVATE KEY-----"
-        )
-        return serialization.load_pem_private_key(pem_pkcs8.encode(), password=None, backend=default_backend())
-    except Exception as e2:
-        logger.warning(f"PEM load attempt 2 (PKCS#8 swap) failed: {e2}")
-
-    # Attempt 3: Strip PEM headers and load raw DER bytes
-    try:
-        pem_str = raw.decode()
-        lines = [l for l in pem_str.strip().split("\n") if not l.startswith("-----")]
-        der_bytes = base64.b64decode("".join(lines))
-        return serialization.load_der_private_key(der_bytes, password=None, backend=default_backend())
-    except Exception as e3:
-        logger.error(f"All key load attempts failed. Last error: {e3}")
-        return None
-
-
 def sign_kalshi_request(method: str, path: str) -> dict:
-    """Generate signed headers for Kalshi API requests."""
+    """Generate signed headers for Kalshi API requests using RSA-PSS."""
     try:
         timestamp   = str(int(time.time() * 1000))
         message     = f"{timestamp}{method}{path}"
-        private_key = load_kalshi_private_key()
-        if private_key is None:
-            logger.error("Kalshi signing skipped — could not load private key.")
-            return {"Content-Type": "application/json"}
-        signature = private_key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256())
-        sig_b64   = base64.b64encode(signature).decode()
+        pem         = base64.b64decode(KALSHI_PRIVATE_KEY_B64)
+        private_key = serialization.load_pem_private_key(pem, password=None, backend=default_backend())
+        signature   = private_key.sign(
+            message.encode(),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256()
+        )
+        sig_b64 = base64.b64encode(signature).decode()
         return {
             "KALSHI-ACCESS-KEY":       KALSHI_API_KEY,
             "KALSHI-ACCESS-TIMESTAMP": timestamp,
