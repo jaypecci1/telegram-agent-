@@ -608,7 +608,25 @@ async def autonomous_scanner(app):
                     logger.info(f"Got {len(markets)} markets. Sample tickers: {[m.get('ticker') for m in markets[:5]]}")
                     opportunities = []
 
-                    for market in markets[:20]:  # Analyze top 20
+                    # Keywords that indicate good tradeable markets (economics, politics, finance)
+                    GOOD_KEYWORDS = [
+                        "fed", "rate", "inflation", "gdp", "recession", "unemployment",
+                        "trump", "election", "president", "congress", "senate", "house",
+                        "bitcoin", "crypto", "stock", "market", "dow", "nasdaq", "sp500",
+                        "oil", "gold", "dollar", "economy", "job", "cpi", "fomc",
+                        "war", "china", "russia", "iran", "tariff", "trade",
+                        "supreme", "court", "law", "bill", "policy",
+                    ]
+                    # Keywords to skip (sports, gaming, entertainment)
+                    SKIP_KEYWORDS = [
+                        "sports", "game", "nfl", "nba", "mlb", "nhl", "soccer", "football",
+                        "basketball", "baseball", "hockey", "tennis", "golf", "racing",
+                        "esport", "gaming", "championship", "tournament", "league",
+                        "oscar", "grammy", "emmy", "award", "celebrity", "actor",
+                        "kxmve", "kxmvsports", "multigame",
+                    ]
+
+                    for market in markets:  # Check all 50
                         ticker    = market.get("ticker", "")
                         title     = market.get("title", "")
                         yes_price = market.get("yes_bid", 0) or market.get("yes_ask", 0) or market.get("last_price", 0) or 0
@@ -616,7 +634,18 @@ async def autonomous_scanner(app):
                         if not ticker or not title or yes_price <= 5 or yes_price >= 95:
                             continue
 
-                        no_price = 100 - yes_price
+                        title_lower  = title.lower()
+                        ticker_lower = ticker.lower()
+
+                        # Skip sports/entertainment markets
+                        if any(kw in title_lower or kw in ticker_lower for kw in SKIP_KEYWORDS):
+                            continue
+
+                        # Only trade markets we can research well
+                        if not any(kw in title_lower for kw in GOOD_KEYWORDS):
+                            continue
+
+                        no_price  = 100 - yes_price
                         min_price = min(yes_price, no_price)
 
                         if min_price < 10:
@@ -628,6 +657,8 @@ async def autonomous_scanner(app):
                             "yes_price": yes_price,
                             "no_price": no_price,
                         })
+
+                    logger.info(f"Found {len(opportunities)} tradeable opportunities after filtering.")
 
                     for opp in opportunities[:5]:  # Deep analyze top 5
                         exposure = get_current_exposure()
