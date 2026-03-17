@@ -23,41 +23,15 @@ ANTHROPIC_API_KEY = "".join(os.environ["ANTHROPIC_API_KEY"].split())
 SUPABASE_URL      = os.environ["SUPABASE_URL"].strip()
 SUPABASE_KEY      = os.environ["SUPABASE_KEY"].strip()
 TAVILY_API_KEY    = "".join(os.environ["TAVILY_API_KEY"].split())
-KALSHI_EMAIL      = os.environ.get("KALSHI_EMAIL", "").strip()
-KALSHI_PASSWORD   = os.environ.get("KALSHI_PASSWORD", "").strip()
+KALSHI_API_KEY    = "".join(os.environ.get("KALSHI_API_KEY", "").split())
 
 # ── Clients ───────────────────────────────────────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 db     = create_client(SUPABASE_URL, SUPABASE_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
-# ── Kalshi session token (cached) ─────────────────────────────────────────────
-_kalshi_token = None
-
-def get_kalshi_token() -> str:
-    global _kalshi_token
-    if _kalshi_token:
-        return _kalshi_token
-    try:
-        with httpx.Client() as client:
-            r = client.post(
-                f"{KALSHI_BASE_URL}/login",
-                json={"email": KALSHI_EMAIL, "password": KALSHI_PASSWORD},
-                timeout=10,
-            )
-            if r.status_code == 200:
-                _kalshi_token = r.json().get("token", "")
-                logger.info("Kalshi login successful.")
-                return _kalshi_token
-            else:
-                logger.error(f"Kalshi login failed: {r.text}")
-                return ""
-    except Exception as e:
-        logger.error(f"Kalshi login error: {e}")
-        return ""
-
 # ── Trading Config ────────────────────────────────────────────────────────────
-KALSHI_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_BASE_URL         = "https://api.elections.kalshi.com/trade-api/v2"
 MAX_PER_TRADE           = 2.50    # Max $ per trade
 MAX_TOTAL_EXPOSURE      = 20.00   # Max $ in open positions at once
 MIN_EDGE                = 0.08    # Min edge (8%) to consider a trade
@@ -93,16 +67,10 @@ Current date and time: {datetime}"""
 
 # ── Kalshi API helpers ────────────────────────────────────────────────────────
 def kalshi_headers():
-    global _kalshi_token
-    token = get_kalshi_token()
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {KALSHI_API_KEY}",
         "Content-Type": "application/json",
     }
-
-def reset_kalshi_token():
-    global _kalshi_token
-    _kalshi_token = None
 
 def get_kalshi_balance() -> dict:
     try:
@@ -768,7 +736,7 @@ async def main():
     async with app:
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        if KALSHI_EMAIL:
+        if KALSHI_API_KEY:
             asyncio.create_task(autonomous_scanner(app))
             logger.info("Kalshi autonomous scanner started.")
         await asyncio.Event().wait()
