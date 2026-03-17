@@ -4,6 +4,7 @@ import logging
 import httpx
 import time
 import base64
+import uuid
 from datetime import datetime
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -150,12 +151,14 @@ def place_kalshi_order(ticker: str, side: str, price_cents: int, count: int) -> 
         path = "/trade-api/v2/portfolio/orders"
         payload = {
             "ticker": ticker,
+            "client_order_id": str(uuid.uuid4()),
             "action": "buy",
             "type": "limit",
             "side": side,
             "count": count,
             f"{side}_price": price_cents,
         }
+        logger.info(f"Placing order: ticker={ticker} side={side} price={price_cents}c count={count}")
         with httpx.Client() as client:
             r = client.post(
                 f"{KALSHI_BASE_URL}/portfolio/orders",
@@ -163,6 +166,7 @@ def place_kalshi_order(ticker: str, side: str, price_cents: int, count: int) -> 
                 json=payload,
                 timeout=15,
             )
+            logger.info(f"Order response {r.status_code}: {r.text[:300]}")
             if r.status_code in (200, 201):
                 return {"success": True, "order": r.json().get("order", {})}
             return {"success": False, "error": r.text}
@@ -601,12 +605,13 @@ async def autonomous_scanner(app):
 
                 if markets_result["success"]:
                     markets = markets_result["markets"]
+                    logger.info(f"Got {len(markets)} markets. Sample tickers: {[m.get('ticker') for m in markets[:5]]}")
                     opportunities = []
 
                     for market in markets[:20]:  # Analyze top 20
                         ticker    = market.get("ticker", "")
                         title     = market.get("title", "")
-                        yes_price = market.get("yes_bid", 0) or market.get("last_price", 0) or 0
+                        yes_price = market.get("yes_bid", 0) or market.get("yes_ask", 0) or market.get("last_price", 0) or 0
 
                         if not ticker or not title or yes_price <= 5 or yes_price >= 95:
                             continue
