@@ -629,52 +629,91 @@ async def autonomous_scanner(app):
     while True:
         try:
             if not TRADING_PAUSED and KALSHI_API_KEY:
-                logger.info("Scanning Kalshi markets...")
-                markets_result = get_kalshi_markets_paginated(pages=5)
+                logger.info("Scanning Kalshi markets via web search + direct series...")
+                opportunities = []
 
-                if markets_result["success"]:
-                    markets = markets_result["markets"]
-                    logger.info(f"Got {len(markets)} markets. Sample tickers: {[m.get('ticker') for m in markets[:5]]}")
-                    opportunities = []
+                # Step 1: Query known economics/politics/finance series directly
+                KNOWN_SERIES = [
+                    "INXD", "BTCUSD", "ETHUSD", "NASDAQ", "GOLD",
+                    "FOMC", "FED", "CPI", "GDP", "UNEMPLOYMENT",
+                    "TRUMP", "CONGRESS", "SENATE", "POTUS", "SCOTUS",
+                    "KXBTC", "KXETH", "KXSPX", "KXOIL", "KXGOLD",
+                ]
+                series_markets = []
+                for series in KNOWN_SERIES:
+                    try:
+                        path = "/trade-api/v2/markets"
+                        with httpx.Client() as client:
+                            r = client.get(
+                                f"{KALSHI_BASE_URL}/markets",
+                                headers=sign_kalshi_request("GET", path),
+                                params={"limit": 50, "status": "open", "series_ticker": series},
+                                timeout=10,
+                            )
+                            if r.status_code == 200:
+                                found = r.json().get("markets", [])
+                                if found:
+                                    logger.info(f"Series {series}: found {len(found)} markets")
+                                series_markets.extend(found)
+                    except Exception as e:
+                        logger.warning(f"Series {series} failed: {e}")
 
-                    # Keywords to skip (sports, gaming, entertainment)
-                    SKIP_KEYWORDS = [
-                        "nfl", "nba", "mlb", "nhl", "soccer", "football",
-                        "basketball", "baseball", "hockey", "tennis", "golf", "racing",
-                        "esport", "gaming", "championship", "tournament",
-                        "oscar", "grammy", "emmy", "celebrity", "actor",
-                        "kxmve", "multigame",
-                    ]
+                # Step 2: Use Tavily to discover current Kalshi market tickers
+                import re
+                try:
+                    search_results = tavily.search(
+                        "kalshi.com prediction market open 2026 economics politics federal reserve bitcoin",
+                        max_results=5
+                    )
+                    discovered_tickers = set()
+                    for r in search_results.get("results", []):
+                        text = r.get("content", "") + " " + r.get("url", "")
+                        # Kalshi tickers look like: INXD-25MAR2026-B5200, FED-2026JUN-T5.25, etc.
+                        found_tickers = re.findall(r'\b[A-Z][A-Z0-9]{1,10}-[A-Z0-9]{4,}\b', text)
+                        discovered_tickers.update(found_tickers[:5])
 
-                    for market in markets:  # Check all 50
-                        ticker    = market.get("ticker", "")
-                        title     = market.get("title", "")
-                        yes_price = market.get("yes_bid", 0) or market.get("yes_ask", 0) or market.get("last_price", 0) or 0
+                    logger.info(f"Web search discovered tickers: {list(discovered_tickers)[:10]}")
 
-                        if not ticker or not title or yes_price <= 5 or yes_price >= 95:
-                            continue
+                    for ticker in list(discovered_tickers)[:10]:
+                        result = get_kalshi_market(ticker)
+                        if result["success"]:
+                            series_markets.append(result["market"])
+                except Exception as e:
+                    logger.warning(f"Web search discovery failed: {e}")
 
-                        title_lower  = title.lower()
-                        ticker_lower = ticker.lower()
+                logger.info(f"Total candidate markets from series+search: {len(series_markets)}")
 
-                        # Skip sports/entertainment markets
-                        if any(kw in title_lower or kw in ticker_lower for kw in SKIP_KEYWORDS):
-                            continue
+                # Step 3: Filter and build opportunities
+                seen = set()
+                for market in series_markets:
+                    ticker    = market.get("ticker", "")
+                    title     = market.get("title", "")
+                    yes_price = market.get("yes_bid", 0) or market.get("yes_ask", 0) or market.get("last_price", 0) or 0
 
-                        no_price  = 100 - yes_price
-                        min_price = min(yes_price, no_price)
+                    if not ticker or not title or ticker in seen:
+                        continue
+                    if yes_price <= 5 or yes_price >= 95:
+                        continue
 
-                        if min_price < 10:
-                            continue
+                    # Skip esports/sports
+                    combined = (title + ticker).lower()
+                    if any(kw in combined for kw in ["kxmve", "kxmvsport", "multigame", "esport"]):
+                        continue
 
-                        opportunities.append({
-                            "ticker": ticker,
-                            "title": title,
-                            "yes_price": yes_price,
-                            "no_price": no_price,
-                        })
+                    no_price  = 100 - yes_price
+                    min_price = min(yes_price, no_price)
+                    if min_price < 10:
+                        continue
 
-                    logger.info(f"Found {len(opportunities)} tradeable opportunities after filtering.")
+                    seen.add(ticker)
+                    opportunities.append({
+                        "ticker": ticker,
+                        "title": title,
+                        "yes_price": yes_price,
+                        "no_price": no_price,
+                    })
+
+                logger.info(f"Found {len(opportunities)} tradeable opportunities after filtering.")
 
                     for opp in opportunities[:5]:  # Deep analyze top 5
                         exposure = get_current_exposure()
