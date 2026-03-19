@@ -601,29 +601,20 @@ async def autonomous_scanner(app):
         try:
             if not TRADING_PAUSED and KALSHI_API_KEY:
                 logger.info("Scanning Kalshi markets...")
-                markets_result = get_kalshi_markets(limit=50)
+                markets_result = get_kalshi_markets(limit=200)
 
                 if markets_result["success"]:
                     markets = markets_result["markets"]
                     logger.info(f"Got {len(markets)} markets. Sample tickers: {[m.get('ticker') for m in markets[:5]]}")
                     opportunities = []
 
-                    # Keywords that indicate good tradeable markets (economics, politics, finance)
-                    GOOD_KEYWORDS = [
-                        "fed", "rate", "inflation", "gdp", "recession", "unemployment",
-                        "trump", "election", "president", "congress", "senate", "house",
-                        "bitcoin", "crypto", "stock", "market", "dow", "nasdaq", "sp500",
-                        "oil", "gold", "dollar", "economy", "job", "cpi", "fomc",
-                        "war", "china", "russia", "iran", "tariff", "trade",
-                        "supreme", "court", "law", "bill", "policy",
-                    ]
                     # Keywords to skip (sports, gaming, entertainment)
                     SKIP_KEYWORDS = [
-                        "sports", "game", "nfl", "nba", "mlb", "nhl", "soccer", "football",
+                        "nfl", "nba", "mlb", "nhl", "soccer", "football",
                         "basketball", "baseball", "hockey", "tennis", "golf", "racing",
-                        "esport", "gaming", "championship", "tournament", "league",
-                        "oscar", "grammy", "emmy", "award", "celebrity", "actor",
-                        "kxmve", "kxmvsports", "multigame",
+                        "esport", "gaming", "championship", "tournament",
+                        "oscar", "grammy", "emmy", "celebrity", "actor",
+                        "kxmve", "multigame",
                     ]
 
                     for market in markets:  # Check all 50
@@ -639,10 +630,6 @@ async def autonomous_scanner(app):
 
                         # Skip sports/entertainment markets
                         if any(kw in title_lower or kw in ticker_lower for kw in SKIP_KEYWORDS):
-                            continue
-
-                        # Only trade markets we can research well
-                        if not any(kw in title_lower for kw in GOOD_KEYWORDS):
                             continue
 
                         no_price  = 100 - yes_price
