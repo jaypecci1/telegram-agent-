@@ -685,9 +685,12 @@ async def autonomous_scanner(app):
 
                 # Step 3: Filter and build opportunities
                 seen = set()
-                # Log first 5 candidates so we can see what prices look like
+                # Log full structure of first market so we can see ALL available fields
+                if series_markets:
+                    logger.info(f"FULL MARKET OBJECT KEYS: {list(series_markets[0].keys())}")
+                    logger.info(f"FULL MARKET SAMPLE: {series_markets[0]}")
                 for m in series_markets[:5]:
-                    logger.info(f"Sample market: {m.get('ticker')} | yes_bid={m.get('yes_bid')} yes_ask={m.get('yes_ask')} last={m.get('last_price')} | {m.get('title','')[:60]}")
+                    logger.info(f"Sample market: {m.get('ticker')} | yes_bid={m.get('yes_bid')} yes_ask={m.get('yes_ask')} last={m.get('last_price')} volume={m.get('volume')} oi={m.get('open_interest')} | {m.get('title','')[:60]}")
 
                 for market in series_markets:
                     ticker    = market.get("ticker", "")
