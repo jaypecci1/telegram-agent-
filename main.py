@@ -685,14 +685,20 @@ async def autonomous_scanner(app):
 
                 # Step 3: Filter and build opportunities
                 seen = set()
+                # Log first 5 candidates so we can see what prices look like
+                for m in series_markets[:5]:
+                    logger.info(f"Sample market: {m.get('ticker')} | yes_bid={m.get('yes_bid')} yes_ask={m.get('yes_ask')} last={m.get('last_price')} | {m.get('title','')[:60]}")
+
                 for market in series_markets:
                     ticker    = market.get("ticker", "")
                     title     = market.get("title", "")
-                    yes_price = market.get("yes_bid", 0) or market.get("yes_ask", 0) or market.get("last_price", 0) or 0
+                    # Try all price fields
+                    yes_bid   = market.get("yes_bid") or 0
+                    yes_ask   = market.get("yes_ask") or 0
+                    last      = market.get("last_price") or 0
+                    yes_price = yes_bid or yes_ask or last
 
                     if not ticker or not title or ticker in seen:
-                        continue
-                    if yes_price <= 5 or yes_price >= 95:
                         continue
 
                     # Skip esports/sports
@@ -700,11 +706,15 @@ async def autonomous_scanner(app):
                     if any(kw in combined for kw in ["kxmve", "kxmvsport", "multigame", "esport"]):
                         continue
 
-                    no_price  = 100 - yes_price
-                    min_price = min(yes_price, no_price)
-                    if min_price < 10:
+                    # Skip markets with no price activity at all
+                    if yes_price == 0:
                         continue
 
+                    # Skip extreme probability markets (near certainties)
+                    if yes_price <= 3 or yes_price >= 97:
+                        continue
+
+                    no_price = 100 - yes_price
                     seen.add(ticker)
                     opportunities.append({
                         "ticker": ticker,
