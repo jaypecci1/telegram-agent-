@@ -124,6 +124,35 @@ def get_kalshi_markets(limit: int = 100) -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+def get_kalshi_markets_paginated(pages: int = 5) -> dict:
+    """Page through Kalshi markets to find non-esports opportunities."""
+    all_markets = []
+    cursor = None
+    try:
+        with httpx.Client() as client:
+            for _ in range(pages):
+                params = {"limit": 200, "status": "open"}
+                if cursor:
+                    params["cursor"] = cursor
+                path = "/trade-api/v2/markets"
+                r = client.get(
+                    f"{KALSHI_BASE_URL}/markets",
+                    headers=sign_kalshi_request("GET", path),
+                    params=params,
+                    timeout=15,
+                )
+                if r.status_code != 200:
+                    break
+                data     = r.json()
+                markets  = data.get("markets", [])
+                cursor   = data.get("cursor")
+                all_markets.extend(markets)
+                if not cursor or not markets:
+                    break
+        return {"success": True, "markets": all_markets}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 def get_kalshi_market(ticker: str) -> dict:
     try:
         path = f"/trade-api/v2/markets/{ticker}"
@@ -601,7 +630,7 @@ async def autonomous_scanner(app):
         try:
             if not TRADING_PAUSED and KALSHI_API_KEY:
                 logger.info("Scanning Kalshi markets...")
-                markets_result = get_kalshi_markets(limit=200)
+                markets_result = get_kalshi_markets_paginated(pages=5)
 
                 if markets_result["success"]:
                     markets = markets_result["markets"]
