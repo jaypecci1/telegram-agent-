@@ -693,13 +693,8 @@ async def autonomous_scanner(app):
                     logger.info(f"Sample market: {m.get('ticker')} | yes_bid={m.get('yes_bid')} yes_ask={m.get('yes_ask')} last={m.get('last_price')} volume={m.get('volume')} oi={m.get('open_interest')} | {m.get('title','')[:60]}")
 
                 for market in series_markets:
-                    ticker    = market.get("ticker", "")
-                    title     = market.get("title", "")
-                    # Try all price fields
-                    yes_bid   = market.get("yes_bid") or 0
-                    yes_ask   = market.get("yes_ask") or 0
-                    last      = market.get("last_price") or 0
-                    yes_price = yes_bid or yes_ask or last
+                    ticker = market.get("ticker", "")
+                    title  = market.get("title", "")
 
                     if not ticker or not title or ticker in seen:
                         continue
@@ -709,12 +704,23 @@ async def autonomous_scanner(app):
                     if any(kw in combined for kw in ["kxmve", "kxmvsport", "multigame", "esport"]):
                         continue
 
-                    # Skip markets with no price activity at all
+                    # Prices are in dollars — convert to cents
+                    yes_bid_d = float(market.get("yes_bid_dollars") or 0)
+                    yes_ask_d = float(market.get("yes_ask_dollars") or 0)
+                    last_d    = float(market.get("last_price_dollars") or 0)
+                    yes_price = round((yes_bid_d or yes_ask_d or last_d) * 100)
+
+                    # Must have some trading volume
+                    volume = float(market.get("volume_fp") or 0)
+                    if volume == 0:
+                        continue
+
+                    # Skip markets with no price
                     if yes_price == 0:
                         continue
 
-                    # Skip extreme probability markets (near certainties)
-                    if yes_price <= 3 or yes_price >= 97:
+                    # Skip extreme probability markets
+                    if yes_price <= 5 or yes_price >= 95:
                         continue
 
                     no_price = 100 - yes_price
