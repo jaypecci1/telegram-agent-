@@ -715,65 +715,58 @@ async def autonomous_scanner(app):
 
                 logger.info(f"Found {len(opportunities)} tradeable opportunities after filtering.")
 
-                    for opp in opportunities[:5]:  # Deep analyze top 5
-                        exposure = get_current_exposure()
-                        if exposure >= MAX_TOTAL_EXPOSURE:
-                            logger.info("Max exposure reached, skipping scan.")
-                            break
+                for opp in opportunities[:5]:  # Deep analyze top 5
+                    exposure = get_current_exposure()
+                    if exposure >= MAX_TOTAL_EXPOSURE:
+                        logger.info("Max exposure reached, skipping scan.")
+                        break
 
-                        analysis_text = run_tool("scan_and_analyze_market", {
+                    analysis_text = run_tool("scan_and_analyze_market", {
+                        "ticker": opp["ticker"],
+                        "title": opp["title"],
+                        "current_yes_price": opp["yes_price"],
+                    })
+
+                    lines = analysis_text.strip().split("\n")
+                    parsed = {}
+                    for line in lines:
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            parsed[k.strip()] = v.strip()
+
+                    bet        = parsed.get("BET", "SKIP").upper()
+                    confidence = float(parsed.get("CONFIDENCE", "0").replace("%",""))
+                    reason     = parsed.get("REASON", "")
+                    true_prob  = float(parsed.get("TRUE_PROB", "0"))
+
+                    if bet == "SKIP" or confidence < (CONFIDENCE_THRESHOLD * 100):
+                        continue
+
+                    side        = "yes" if bet == "YES" else "no"
+                    price_cents = opp["yes_price"] if side == "yes" else opp["no_price"]
+
+                    if AUTO_TRADE:
+                        result = run_tool("execute_trade", {
                             "ticker": opp["ticker"],
                             "title": opp["title"],
-                            "current_yes_price": opp["yes_price"],
+                            "side": side,
+                            "price_cents": price_cents,
+                            "reasoning": reason,
                         })
+                        message = f"🤖 Auto-trade placed!\n\n{opp['title']}\nBet: {side.upper()} at {price_cents}¢\nConfidence: {confidence:.0f}%\nReason: {reason}\n\nResult: {result}"
+                    else:
+                        message = (
+                            f"📊 Trade opportunity found!\n\n"
+                            f"Market: {opp['title']}\n"
+                            f"Bet: {side.upper()} at {price_cents}¢\n"
+                            f"My estimated probability: {true_prob:.0f}%\n"
+                            f"Confidence: {confidence:.0f}%\n"
+                            f"Reason: {reason}\n\n"
+                            f"Reply 'yes place it' to execute, or ignore to skip."
+                        )
 
-                        lines = analysis_text.strip().split("\n")
-                        parsed = {}
-                        for line in lines:
-                            if ":" in line:
-                                k, v = line.split(":", 1)
-                                parsed[k.strip()] = v.strip()
-
-                        bet        = parsed.get("BET", "SKIP").upper()
-                        confidence = float(parsed.get("CONFIDENCE", "0").replace("%",""))
-                        reason     = parsed.get("REASON", "")
-                        true_prob  = float(parsed.get("TRUE_PROB", "0"))
-
-                        if bet == "SKIP" or confidence < (CONFIDENCE_THRESHOLD * 100):
-                            continue
-
-                        side        = "yes" if bet == "YES" else "no"
-                        price_cents = opp["yes_price"] if side == "yes" else opp["no_price"]
-
-                        if AUTO_TRADE:
-                            result = run_tool("execute_trade", {
-                                "ticker": opp["ticker"],
-                                "title": opp["title"],
-                                "side": side,
-                                "price_cents": price_cents,
-                                "reasoning": reason,
-                            })
-                            message = f"🤖 Auto-trade placed!\n\n{opp['title']}\nBet: {side.upper()} at {price_cents}¢\nConfidence: {confidence:.0f}%\nReason: {reason}\n\nResult: {result}"
-                        else:
-                            message = (
-                                f"📊 Trade opportunity found!\n\n"
-                                f"Market: {opp['title']}\n"
-                                f"Bet: {side.upper()} at {price_cents}¢\n"
-                                f"My estimated probability: {true_prob:.0f}%\n"
-                                f"Confidence: {confidence:.0f}%\n"
-                                f"Reason: {reason}\n\n"
-                                f"Reply 'yes place it' to execute, or ignore to skip."
-                            )
-
-                        try:
-                            chats = db.table("conversations").select("*").order("timestamp", desc=True).limit(1).execute()
-                            if chats.data:
-                                pass
-                        except:
-                            pass
-
-                        await app.bot.send_message(chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""), text=message)
-                        await asyncio.sleep(5)
+                    await app.bot.send_message(chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""), text=message)
+                    await asyncio.sleep(5)
 
         except Exception as e:
             logger.error(f"Scanner error: {e}")
