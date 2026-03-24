@@ -41,7 +41,7 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 KALSHI_BASE_URL         = "https://api.elections.kalshi.com/trade-api/v2"
 BTC15M_SERIES           = "KXBTC15M"
 BET_SIZES               = [2.00, 4.00, 10.00]   # Martingale sequence ($)
-STREAK_REQUIRED         = 6                       # Consecutive same-direction to trigger
+STREAK_REQUIRED         = 5                       # Consecutive same-direction to trigger
 COOLDOWN_MINUTES        = 60                      # Pause after 3 straight losses
 CHECK_INTERVAL          = 60                      # Check every 60 seconds
 TRADING_PAUSED          = False                   # Can be toggled via Telegram command
