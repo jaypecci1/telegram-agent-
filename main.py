@@ -660,7 +660,7 @@ def get_kxbtc15m_settled(limit: int = 20) -> list:
             r = client.get(
                 f"{KALSHI_BASE_URL}/markets",
                 headers=sign_kalshi_request("GET", path),
-                params={"limit": limit, "status": "finalized", "series_ticker": BTC15M_SERIES},
+                params={"limit": limit, "status": "settled", "series_ticker": BTC15M_SERIES},
                 timeout=15,
             )
             if r.status_code == 200:
