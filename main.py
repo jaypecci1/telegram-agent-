@@ -39,12 +39,18 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
 # ── Trading Config ────────────────────────────────────────────────────────────
 KALSHI_BASE_URL         = "https://api.elections.kalshi.com/trade-api/v2"
-BTC15M_SERIES           = "KXBTC15M"
 BET_SIZES               = [2.00, 4.00, 10.00]   # Martingale sequence ($)
 STREAK_REQUIRED         = 5                       # Consecutive same-direction to trigger
 COOLDOWN_MINUTES        = 60                      # Pause after 3 straight losses
 CHECK_INTERVAL          = 60                      # Check every 60 seconds
 TRADING_PAUSED          = False                   # Can be toggled via Telegram command
+
+# Markets to run the strategy on: (series_ticker, state_key, display_name)
+CRYPTO_MARKETS = [
+    ("KXBTC15M",  "btc15m_state",  "BTC"),
+    ("KXETH15M",  "eth15m_state",  "ETH"),
+    ("KXSOL15M",  "sol15m_state",  "SOL"),
+]
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are Pecci, Jay's personal AI assistant. Jay is a young adult who works as an automotive and light diesel mechanic doing side jobs, and he is studying Economics at Texas Tech University. His long-term goal is to open his own mechanic shop. He also trades on Kalshi prediction markets.
@@ -56,7 +62,7 @@ You help Jay with:
 - Managing his day-to-day life as a young adult
 - Monitoring and trading on Kalshi prediction markets
 
-Trading strategy: You run an autonomous BTC 15-minute mean-reversion + martingale strategy on Kalshi's KXBTC15M markets. You watch for 5 consecutive UP or DOWN results, then bet the reversal. Bet sizes are $2 → $4 → $10. If all three lose, you pause for 1 hour and reset. Any win resets the whole cycle. You notify Jay automatically when bets are placed, won, or lost.
+Trading strategy: You run an autonomous 15-minute mean-reversion + martingale strategy on three Kalshi crypto markets simultaneously: BTC (KXBTC15M), ETH (KXETH15M), and SOL (KXSOL15M). For each coin independently, you watch for 5 consecutive UP or DOWN results, then bet the reversal on the next open market. Bet sizes are $2 → $4 → $10. If all three bets lose, you pause that coin for 1 hour and reset. Any win resets that coin's cycle. You notify Jay automatically when bets are placed, won, or lost.
 
 Telegram trading commands Jay can use:
 - "pause trading" - stop all new trades
@@ -617,17 +623,10 @@ async def run_claude(user_text: str, extra_system: str = "") -> str:
     return "I got stuck in a loop — try again."
 
 
-# ── BTC 15m strategy helpers ──────────────────────────────────────────────────
+# ── Crypto 15m strategy helpers ───────────────────────────────────────────────
 import json as _json
 
-def get_btc15m_state() -> dict:
-    """Load BTC 15m strategy state from Supabase memory table."""
-    try:
-        res = db.table("memory").select("*").eq("key", "btc15m_state").execute()
-        if res.data:
-            return _json.loads(res.data[0]["value"])
-    except Exception as e:
-        logger.warning(f"Could not load btc15m_state: {e}")
+def _default_state() -> dict:
     return {
         "phase": "watching",          # watching | betting | cooldown
         "streak_direction": None,     # "UP" | "DOWN" | None
@@ -640,47 +639,57 @@ def get_btc15m_state() -> dict:
         "active_bet_side": None,
     }
 
-def save_btc15m_state(state: dict):
-    """Persist BTC 15m strategy state to Supabase."""
+def get_market_state(state_key: str) -> dict:
+    """Load strategy state for a given market from Supabase."""
     try:
-        val = _json.dumps(state)
-        existing = db.table("memory").select("id").eq("key", "btc15m_state").execute()
-        if existing.data:
-            db.table("memory").update({"value": val}).eq("key", "btc15m_state").execute()
-        else:
-            db.table("memory").insert({"key": "btc15m_state", "value": val}).execute()
+        res = db.table("memory").select("*").eq("key", state_key).execute()
+        if res.data:
+            return _json.loads(res.data[0]["value"])
     except Exception as e:
-        logger.error(f"Failed to save btc15m_state: {e}")
+        logger.warning(f"Could not load {state_key}: {e}")
+    return _default_state()
 
-def get_kxbtc15m_settled(limit: int = 20) -> list:
-    """Fetch recently finalized KXBTC15M markets, sorted oldest→newest."""
+def save_market_state(state_key: str, state: dict):
+    """Persist strategy state for a given market to Supabase."""
+    try:
+        val      = _json.dumps(state)
+        existing = db.table("memory").select("id").eq("key", state_key).execute()
+        if existing.data:
+            db.table("memory").update({"value": val}).eq("key", state_key).execute()
+        else:
+            db.table("memory").insert({"key": state_key, "value": val}).execute()
+    except Exception as e:
+        logger.error(f"Failed to save {state_key}: {e}")
+
+def get_settled_markets(series_ticker: str, limit: int = 25) -> list:
+    """Fetch recently settled markets for a series, sorted oldest→newest."""
     try:
         path = "/trade-api/v2/markets"
         with httpx.Client() as client:
             r = client.get(
                 f"{KALSHI_BASE_URL}/markets",
                 headers=sign_kalshi_request("GET", path),
-                params={"limit": limit, "status": "settled", "series_ticker": BTC15M_SERIES},
+                params={"limit": limit, "status": "settled", "series_ticker": series_ticker},
                 timeout=15,
             )
             if r.status_code == 200:
                 markets = r.json().get("markets", [])
                 markets.sort(key=lambda m: m.get("close_time", ""))
                 return markets
-            logger.warning(f"KXBTC15M settled fetch {r.status_code}: {r.text[:200]}")
+            logger.warning(f"{series_ticker} settled fetch {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        logger.error(f"get_kxbtc15m_settled error: {e}")
+        logger.error(f"get_settled_markets({series_ticker}) error: {e}")
     return []
 
-def get_kxbtc15m_open() -> dict:
-    """Fetch the current open KXBTC15M market (soonest to close)."""
+def get_open_market(series_ticker: str) -> dict:
+    """Fetch the current open market for a series (soonest to close)."""
     try:
         path = "/trade-api/v2/markets"
         with httpx.Client() as client:
             r = client.get(
                 f"{KALSHI_BASE_URL}/markets",
                 headers=sign_kalshi_request("GET", path),
-                params={"limit": 5, "status": "open", "series_ticker": BTC15M_SERIES},
+                params={"limit": 5, "status": "open", "series_ticker": series_ticker},
                 timeout=15,
             )
             if r.status_code == 200:
@@ -689,26 +698,24 @@ def get_kxbtc15m_open() -> dict:
                     markets.sort(key=lambda m: m.get("open_time", ""))
                     return markets[0]
     except Exception as e:
-        logger.error(f"get_kxbtc15m_open error: {e}")
+        logger.error(f"get_open_market({series_ticker}) error: {e}")
     return {}
 
 
-# ── BTC 15m mean-reversion + martingale strategy ──────────────────────────────
-async def btc15m_strategy(app):
+# ── Generic crypto 15m mean-reversion + martingale strategy ───────────────────
+async def crypto15m_strategy(app, series_ticker: str, state_key: str, coin: str):
     """
-    BTC 15-minute mean-reversion + capped martingale strategy.
+    Mean-reversion + capped martingale for any Kalshi crypto 15-min series.
 
-    Logic:
-      1. Fetch recently finalized KXBTC15M markets and track consecutive UP/DOWN streaks.
-      2. Once 6 in a row are the same direction, switch to betting mode and
-         bet the reversal on the next open market.
-      3. Martingale bet sizes: $2 → $4 → $10.
-      4. If all 3 lose consecutively, enter a 1-hour cooldown then reset.
-      5. Any win resets everything back to streak-watching mode.
+    - Watches for STREAK_REQUIRED consecutive UP or DOWN results
+    - Bets the reversal on the next open market
+    - Martingale: $2 → $4 → $10
+    - 3 straight losses → 1-hour cooldown, then reset
+    - Any win → full reset back to watching
     """
     global TRADING_PAUSED
     await asyncio.sleep(30)
-    logger.info("BTC 15m strategy started.")
+    logger.info(f"{coin} 15m strategy started.")
 
     while True:
         try:
@@ -716,14 +723,15 @@ async def btc15m_strategy(app):
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            state = get_btc15m_state()
+            state   = get_market_state(state_key)
             now_str = datetime.utcnow().isoformat()
+            tag     = f"{coin}15m"
 
             # ── 1. Cooldown check ──────────────────────────────────────────────
             if state["phase"] == "cooldown":
                 cooldown_until = state.get("cooldown_until") or ""
                 if now_str >= cooldown_until:
-                    logger.info("BTC15m: cooldown expired. Resuming watch.")
+                    logger.info(f"{tag}: cooldown expired. Resuming watch.")
                     state.update({
                         "phase": "watching",
                         "streak_direction": None,
@@ -734,50 +742,46 @@ async def btc15m_strategy(app):
                         "active_bet_ticker": None,
                         "active_bet_side": None,
                     })
-                    save_btc15m_state(state)
+                    save_market_state(state_key, state)
                     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
                     if chat_id:
                         await app.bot.send_message(
                             chat_id=chat_id,
-                            text="⏰ BTC 15m: Cooldown over. Back to watching for streaks!"
+                            text=f"⏰ {coin} 15m: Cooldown over. Back to watching for streaks!"
                         )
                 else:
-                    logger.info(f"BTC15m: in cooldown until {cooldown_until}")
+                    logger.info(f"{tag}: in cooldown until {cooldown_until}")
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
             # ── 2. Fetch recently settled markets ─────────────────────────────
-            settled = get_kxbtc15m_settled(limit=25)
+            settled = get_settled_markets(series_ticker)
             if not settled:
-                logger.info("BTC15m: no finalized markets found yet.")
+                logger.info(f"{tag}: no settled markets found yet.")
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            logger.info(f"BTC15m: fetched {len(settled)} finalized markets. Phase={state['phase']}")
+            logger.info(f"{tag}: fetched {len(settled)} settled markets. Phase={state['phase']}")
 
-            # ── 3. Check if our active bet has resolved ────────────────────────
+            # ── 3. Check if active bet resolved ───────────────────────────────
             if state["phase"] == "betting" and state.get("active_bet_ticker"):
                 active_ticker = state["active_bet_ticker"]
                 active_side   = state["active_bet_side"]
-
-                resolved_bet = next(
-                    (m for m in settled if m.get("ticker") == active_ticker), None
-                )
+                resolved_bet  = next((m for m in settled if m.get("ticker") == active_ticker), None)
 
                 if resolved_bet:
                     result_raw = (resolved_bet.get("result") or "").upper()
-                    # YES = BTC went UP, NO = BTC went DOWN
-                    won = (result_raw == active_side.upper())
-                    bet_size = BET_SIZES[state["bet_index"]]
-                    chat_id  = os.environ.get("TELEGRAM_CHAT_ID", "")
+                    won        = (result_raw == active_side.upper())
+                    bet_size   = BET_SIZES[state["bet_index"]]
+                    chat_id    = os.environ.get("TELEGRAM_CHAT_ID", "")
 
                     if won:
-                        logger.info(f"BTC15m: ✅ WON on {active_ticker}! Resetting.")
+                        logger.info(f"{tag}: ✅ WON on {active_ticker}! Resetting.")
                         if chat_id:
                             await app.bot.send_message(
                                 chat_id=chat_id,
                                 text=(
-                                    f"✅ BTC 15m WIN!\n"
+                                    f"✅ {coin} 15m WIN!\n"
                                     f"Market: {active_ticker}\n"
                                     f"Bet: {active_side.upper()} | Size: ${bet_size:.2f}\n\n"
                                     f"Resetting — back to streak watch."
@@ -794,7 +798,7 @@ async def btc15m_strategy(app):
                         })
                     else:
                         state["consecutive_losses"] += 1
-                        logger.info(f"BTC15m: ❌ LOST on {active_ticker}. Losses={state['consecutive_losses']}")
+                        logger.info(f"{tag}: ❌ LOST on {active_ticker}. Losses={state['consecutive_losses']}")
 
                         if state["consecutive_losses"] >= 3:
                             from datetime import timedelta
@@ -807,34 +811,34 @@ async def btc15m_strategy(app):
                                 "active_bet_ticker": None,
                                 "active_bet_side": None,
                             })
-                            logger.info(f"BTC15m: all 3 bets lost. Cooldown until {cooldown_until}")
+                            logger.info(f"{tag}: all 3 bets lost. Cooldown until {cooldown_until}")
                             if chat_id:
                                 await app.bot.send_message(
                                     chat_id=chat_id,
                                     text=(
-                                        f"❌ BTC 15m: All 3 bets lost.\n"
-                                        f"Pausing for {COOLDOWN_MINUTES} minutes "
+                                        f"❌ {coin} 15m: All 3 bets lost.\n"
+                                        f"Pausing for {COOLDOWN_MINUTES} min "
                                         f"(until ~{cooldown_until[:16]} UTC)."
                                     )
                                 )
                         else:
                             next_idx = min(state["bet_index"] + 1, 2)
-                            state["bet_index"] = next_idx
+                            state["bet_index"]        = next_idx
                             state["active_bet_ticker"] = None
                             state["active_bet_side"]   = None
-                            logger.info(f"BTC15m: escalating to bet #{next_idx+1} — ${BET_SIZES[next_idx]:.2f}")
+                            logger.info(f"{tag}: escalating to bet #{next_idx+1} — ${BET_SIZES[next_idx]:.2f}")
                             if chat_id:
                                 await app.bot.send_message(
                                     chat_id=chat_id,
                                     text=(
-                                        f"❌ BTC 15m LOSS on {active_ticker}.\n"
+                                        f"❌ {coin} 15m LOSS on {active_ticker}.\n"
                                         f"Escalating to ${BET_SIZES[next_idx]:.2f}..."
                                     )
                                 )
 
-                    save_btc15m_state(state)
+                    save_market_state(state_key, state)
 
-            # ── 4. Update streak (only when watching) ─────────────────────────
+            # ── 4. Update streak (watching phase only) ─────────────────────────
             if state["phase"] == "watching":
                 last_ticker = state.get("last_processed_ticker")
                 start_idx   = 0
@@ -844,8 +848,7 @@ async def btc15m_strategy(app):
                             start_idx = i + 1
                             break
 
-                new_markets = settled[start_idx:]
-                for m in new_markets:
+                for m in settled[start_idx:]:
                     ticker     = m.get("ticker", "")
                     result_raw = (m.get("result") or "").upper()
                     if result_raw not in ("YES", "NO"):
@@ -861,33 +864,32 @@ async def btc15m_strategy(app):
 
                     state["last_processed_ticker"] = ticker
                     logger.info(
-                        f"BTC15m: {ticker} → {direction} | "
+                        f"{tag}: {ticker} → {direction} | "
                         f"Streak: {state['streak_count']} consecutive {direction}"
                     )
 
                 if state["streak_count"] >= STREAK_REQUIRED:
                     logger.info(
-                        f"BTC15m: 🎯 streak of {state['streak_count']} {state['streak_direction']} detected! "
+                        f"{tag}: 🎯 streak of {state['streak_count']} {state['streak_direction']}! "
                         f"Switching to betting mode."
                     )
-                    state["phase"]             = "betting"
-                    state["bet_index"]         = 0
+                    state["phase"]              = "betting"
+                    state["bet_index"]          = 0
                     state["consecutive_losses"] = 0
 
-                save_btc15m_state(state)
+                save_market_state(state_key, state)
 
-            # ── 5. Place bet if betting and no active bet ──────────────────────
+            # ── 5. Place bet if in betting mode with no active bet ─────────────
             if state["phase"] == "betting" and not state.get("active_bet_ticker"):
-                open_market = get_kxbtc15m_open()
+                open_market = get_open_market(series_ticker)
                 if not open_market:
-                    logger.info("BTC15m: no open KXBTC15M market available yet.")
+                    logger.info(f"{tag}: no open market available yet.")
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
                 ticker   = open_market.get("ticker", "")
                 bet_side = "no" if state["streak_direction"] == "UP" else "yes"
 
-                # Price in dollars → cents
                 yes_ask_d = float(open_market.get("yes_ask_dollars") or 0)
                 last_d    = float(open_market.get("last_price_dollars") or 0)
                 yes_bid_d = float(open_market.get("yes_bid_dollars") or 0)
@@ -902,22 +904,22 @@ async def btc15m_strategy(app):
                 contracts   = max(1, int(bet_dollars / (price_cents / 100)))
 
                 logger.info(
-                    f"BTC15m: placing reversal bet — {ticker} | {bet_side.upper()} | "
+                    f"{tag}: placing reversal bet — {ticker} | {bet_side.upper()} | "
                     f"{price_cents}¢ | {contracts} contracts | ${bet_dollars:.2f}"
                 )
 
-                result = place_kalshi_order(ticker, bet_side, price_cents, contracts)
+                result  = place_kalshi_order(ticker, bet_side, price_cents, contracts)
                 chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
 
                 if result["success"]:
                     state["active_bet_ticker"] = ticker
                     state["active_bet_side"]   = bet_side
-                    save_btc15m_state(state)
+                    save_market_state(state_key, state)
                     if chat_id:
                         await app.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"🎯 BTC 15m Reversal Bet!\n\n"
+                                f"🎯 {coin} 15m Reversal Bet!\n\n"
                                 f"Streak: {state['streak_count']} consecutive {state['streak_direction']}\n"
                                 f"Betting: {bet_side.upper()} on {ticker}\n"
                                 f"Price: {price_cents}¢ | Contracts: {contracts} | ~${bet_dollars:.2f}\n"
@@ -925,15 +927,15 @@ async def btc15m_strategy(app):
                             )
                         )
                 else:
-                    logger.error(f"BTC15m: order failed — {result['error']}")
+                    logger.error(f"{tag}: order failed — {result['error']}")
                     if chat_id:
                         await app.bot.send_message(
                             chat_id=chat_id,
-                            text=f"⚠️ BTC 15m: Order failed — {result['error'][:200]}"
+                            text=f"⚠️ {coin} 15m: Order failed — {result['error'][:200]}"
                         )
 
         except Exception as e:
-            logger.error(f"BTC15m strategy error: {e}")
+            logger.error(f"{tag} strategy error: {e}")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -1011,8 +1013,9 @@ async def main():
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         if KALSHI_API_KEY:
-            asyncio.create_task(btc15m_strategy(app))
-            logger.info("BTC 15m mean-reversion strategy started.")
+            for series_ticker, state_key, coin in CRYPTO_MARKETS:
+                asyncio.create_task(crypto15m_strategy(app, series_ticker, state_key, coin))
+            logger.info(f"Started 15m strategies for: {[c for _,_,c in CRYPTO_MARKETS]}")
         await asyncio.Event().wait()
         await app.updater.stop()
         await app.stop()
