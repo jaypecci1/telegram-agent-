@@ -111,62 +111,6 @@ def get_kalshi_balance() -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def get_kalshi_markets(limit: int = 100) -> dict:
-    try:
-        path = "/trade-api/v2/markets"
-        with httpx.Client() as client:
-            r = client.get(
-                f"{KALSHI_BASE_URL}/markets",
-                headers=sign_kalshi_request("GET", path),
-                params={"limit": limit, "status": "open"},
-                timeout=15,
-            )
-            if r.status_code == 200:
-                return {"success": True, "markets": r.json().get("markets", [])}
-            return {"success": False, "error": r.text}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def get_kalshi_markets_paginated(pages: int = 5) -> dict:
-    """Page through Kalshi markets to find non-esports opportunities."""
-    all_markets = []
-    cursor = None
-    try:
-        with httpx.Client() as client:
-            for _ in range(pages):
-                params = {"limit": 200, "status": "open"}
-                if cursor:
-                    params["cursor"] = cursor
-                path = "/trade-api/v2/markets"
-                r = client.get(
-                    f"{KALSHI_BASE_URL}/markets",
-                    headers=sign_kalshi_request("GET", path),
-                    params=params,
-                    timeout=15,
-                )
-                if r.status_code != 200:
-                    break
-                data     = r.json()
-                markets  = data.get("markets", [])
-                cursor   = data.get("cursor")
-                all_markets.extend(markets)
-                if not cursor or not markets:
-                    break
-        return {"success": True, "markets": all_markets}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def get_kalshi_market(ticker: str) -> dict:
-    try:
-        path = f"/trade-api/v2/markets/{ticker}"
-        with httpx.Client() as client:
-            r = client.get(f"{KALSHI_BASE_URL}/markets/{ticker}", headers=sign_kalshi_request("GET", path), timeout=10)
-            if r.status_code == 200:
-                return {"success": True, "market": r.json().get("market", {})}
-            return {"success": False, "error": r.text}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
 def get_kalshi_positions() -> dict:
     try:
         path = "/trade-api/v2/portfolio/positions"
@@ -204,38 +148,6 @@ def place_kalshi_order(ticker: str, side: str, price_cents: int, count: int) -> 
             return {"success": False, "error": r.text}
     except Exception as e:
         return {"success": False, "error": str(e)}
-
-def calculate_contracts(price_cents: int) -> int:
-    """Calculate how many contracts to buy given our max per trade."""
-    price_dollars = price_cents / 100
-    if price_dollars <= 0:
-        return 0
-    contracts = int(MAX_PER_TRADE / price_dollars)
-    return max(1, contracts)
-
-def get_current_exposure() -> float:
-    """Get total $ currently at risk in open positions."""
-    try:
-        result = db.table("trades").select("estimated_cost").eq("status", "open").execute()
-        return sum(t.get("estimated_cost", 0) or 0 for t in result.data)
-    except:
-        return 0.0
-
-def save_trade(ticker, title, side, price, contracts, cost, order_id, reasoning):
-    try:
-        db.table("trades").insert({
-            "market_ticker": ticker,
-            "market_title": title,
-            "side": side,
-            "price": price,
-            "contracts": contracts,
-            "estimated_cost": cost,
-            "kalshi_order_id": order_id,
-            "status": "open",
-            "reasoning": reasoning,
-        }).execute()
-    except Exception as e:
-        logger.error(f"Failed to save trade: {e}")
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
 TOOLS = [
@@ -383,11 +295,16 @@ TOOLS = [
             "required": ["ticker", "title", "side", "price_cents", "reasoning"],
         },
     },
+    {
+        "name": "get_trading_status",
+        "description": "Get the current live trading status for all crypto markets — shows streak count, direction, phase (watching/betting/cooldown), and active bet info for BTC, ETH, and SOL",
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 # ── Tool execution ────────────────────────────────────────────────────────────
 def run_tool(name: str, inputs: dict) -> str:
-    global TRADING_PAUSED, AUTO_TRADE
+    global TRADING_PAUSED
 
     if name == "search_web":
         try:
@@ -472,8 +389,7 @@ def run_tool(name: str, inputs: dict) -> str:
     if name == "get_kalshi_balance":
         result = get_kalshi_balance()
         if result["success"]:
-            exposure = get_current_exposure()
-            return f"Kalshi Balance: ${result['balance']:.2f}\nCurrent exposure in open trades: ${exposure:.2f}\nRemaining available: ${max(0, MAX_TOTAL_EXPOSURE - exposure):.2f}"
+            return f"Kalshi Balance: ${result['balance']:.2f}"
         return f"Couldn't fetch balance: {result['error']}"
 
     if name == "get_kalshi_positions":
@@ -556,23 +472,45 @@ REASON: [reasoning]"""
         side        = inputs["side"].lower()
         price_cents = inputs["price_cents"]
         reasoning   = inputs["reasoning"]
-
-        exposure = get_current_exposure()
-        if exposure >= MAX_TOTAL_EXPOSURE:
-            return f"Max exposure reached (${exposure:.2f}/${MAX_TOTAL_EXPOSURE}). Cannot place new trades until some close."
-
-        contracts = calculate_contracts(price_cents)
-        cost      = round((price_cents / 100) * contracts, 2)
-
-        if cost > MAX_PER_TRADE:
-            return f"Trade cost ${cost:.2f} exceeds max per trade ${MAX_PER_TRADE}."
+        contracts   = max(1, int(2.00 / (price_cents / 100)))  # Default $2 bet
+        cost        = round((price_cents / 100) * contracts, 2)
 
         result = place_kalshi_order(ticker, side, price_cents, contracts)
         if result["success"]:
-            order = result["order"]
-            save_trade(ticker, title, side, price_cents/100, contracts, cost, order.get("order_id",""), reasoning)
             return f"Trade placed! ✅\nMarket: {title}\nSide: {side.upper()} | Price: {price_cents}¢ | Contracts: {contracts} | Cost: ${cost:.2f}\nReasoning: {reasoning}"
         return f"Trade failed: {result['error']}"
+
+    if name == "get_trading_status":
+        try:
+            lines = [f"📊 Live Trading Status ({STREAK_REQUIRED}-streak trigger)\n"]
+            for series_ticker, state_key, coin in CRYPTO_MARKETS:
+                s = get_market_state(state_key)
+                phase = s.get("phase", "watching")
+                streak_dir   = s.get("streak_direction") or "—"
+                streak_count = s.get("streak_count", 0)
+                bet_index    = s.get("bet_index", 0)
+                losses       = s.get("consecutive_losses", 0)
+                active       = s.get("active_bet_ticker")
+                active_side  = s.get("active_bet_side")
+                cooldown     = s.get("cooldown_until", "")
+
+                if phase == "watching":
+                    status = f"👀 Watching — {streak_count} consecutive {streak_dir}"
+                elif phase == "betting":
+                    if active:
+                        status = f"🎯 Bet active on {active} ({active_side.upper()}) — ${BET_SIZES[bet_index]:.2f} (bet #{bet_index+1})"
+                    else:
+                        status = f"🎯 Betting mode — waiting for next open market (bet #{bet_index+1})"
+                elif phase == "cooldown":
+                    status = f"⏸ Cooldown until ~{cooldown[:16]} UTC"
+                else:
+                    status = phase
+
+                lines.append(f"{'₿' if coin=='BTC' else '⟠' if coin=='ETH' else '◎'} {coin}: {status}")
+
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Failed to get trading status: {e}"
 
     return f"Unknown tool: {name}"
 
@@ -942,10 +880,10 @@ async def crypto15m_strategy(app, series_ticker: str, state_key: str, coin: str)
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global TRADING_PAUSED, AUTO_TRADE
+    global TRADING_PAUSED
     user_text = update.message.text.lower().strip()
 
-    # Store chat ID for scanner notifications
+    # Store chat ID for strategy notifications
     try:
         os.environ["TELEGRAM_CHAT_ID"] = str(update.effective_chat.id)
     except:
@@ -961,25 +899,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "resume trading" in user_text:
         TRADING_PAUSED = False
-        await update.message.reply_text("Trading resumed! I'm back to scanning for opportunities.")
-        return
-
-    if "auto trade on" in user_text:
-        AUTO_TRADE = True
-        await update.message.reply_text("⚡ Fully autonomous trading ON. I'll place trades without asking you first.")
-        return
-
-    if "auto trade off" in user_text:
-        AUTO_TRADE = False
-        await update.message.reply_text("Manual mode ON. I'll alert you before placing any trades.")
-        return
-
-    if "yes place it" in user_text or "yes, place it" in user_text:
-        save_message("user", update.message.text)
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-        final = await run_claude("Place the last trade opportunity you found. Use execute_trade to do it now.")
-        save_message("assistant", final)
-        await update.message.reply_text(final)
+        await update.message.reply_text("Trading resumed! All three strategies are back on.")
         return
 
     save_message("user", update.message.text)
