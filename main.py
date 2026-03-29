@@ -34,7 +34,7 @@ db     = create_client(SUPABASE_URL, SUPABASE_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 # ── Trading Config ────────────────────────────────────────────────────────────
 KALSHI_BASE_URL         = "https://api.elections.kalshi.com/trade-api/v2"
-BET_SIZES               = [5.00, 10.00, 20.00]   # Martingale sequence ($)
+BET_SIZES               = [10.00, 20.00, 40.00]   # Martingale sequence ($)
 STREAK_REQUIRED         = 5                       # Consecutive same-direction to trigger
 COOLDOWN_MINUTES        = 60                      # Pause after 3 straight losses
 CHECK_INTERVAL          = 60                      # Check every 60 seconds
@@ -53,7 +53,7 @@ You help Jay with:
 - Remembering important information from all past conversations
 - Managing his day-to-day life as a young adult
 - Monitoring and trading on Kalshi prediction markets
-Trading strategy: You run an autonomous 15-minute mean-reversion + martingale strategy on three Kalshi crypto markets simultaneously: BTC (KXBTC15M), ETH (KXETH15M), and SOL (KXSOL15M). For each coin independently, you watch for 5 consecutive UP or DOWN results, then bet the reversal on the next open market. Bet sizes are $5 → $10 → $20. If all three bets lose, you pause that coin for 1 hour and reset. Any win resets that coin's cycle. You notify Jay automatically when bets are placed, won, or lost.
+Trading strategy: You run an autonomous 15-minute mean-reversion + martingale strategy on three Kalshi crypto markets simultaneously: BTC (KXBTC15M), ETH (KXETH15M), and SOL (KXSOL15M). For each coin independently, you watch for 5 consecutive UP or DOWN results, then bet the reversal on the next open market. Bet sizes are $10 → $20 → $40. If all three bets lose, you pause that coin for 1 hour and reset. Any win resets that coin's cycle. You notify Jay automatically when bets are placed, won, or lost.
 IMPORTANT: When Jay asks about streaks, trading status, what phase any coin is in, or anything related to the current state of trading, you MUST ALWAYS call the get_trading_status tool. NEVER estimate or guess streak numbers. The real data is stored in the database — use the tool to fetch it.
 IMPORTANT: When Jay asks about trade history or past trades, ALWAYS call the get_trade_history tool. All trades placed by the background strategy are logged in the database with full details including outcome and profit/loss.
 Telegram trading commands Jay can use:
