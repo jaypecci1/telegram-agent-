@@ -109,8 +109,13 @@ def get_kalshi_positions() -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 def place_kalshi_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
+    """Place an order on Kalshi. Uses aggressive pricing to ensure fills."""
     try:
         path = "/trade-api/v2/portfolio/orders"
+        # Use aggressive pricing to guarantee fill:
+        # If buying YES, bid high (99c) to fill immediately at best available
+        # If buying NO, bid high (99c) to fill immediately at best available
+        fill_price = 99  # Bid max to act like a market order — fills at best available price
         payload = {
             "ticker": ticker,
             "client_order_id": str(uuid.uuid4()),
@@ -118,9 +123,9 @@ def place_kalshi_order(ticker: str, side: str, price_cents: int, count: int) -> 
             "type": "limit",
             "side": side,
             "count": count,
-            f"{side}_price": price_cents,
+            f"{side}_price": fill_price,
         }
-        logger.info(f"Placing order: ticker={ticker} side={side} price={price_cents}c count={count}")
+        logger.info(f"Placing order: ticker={ticker} side={side} price={fill_price}c (market mid={price_cents}c) count={count}")
         with httpx.Client() as client:
             r = client.post(
                 f"{KALSHI_BASE_URL}/portfolio/orders",
@@ -128,12 +133,20 @@ def place_kalshi_order(ticker: str, side: str, price_cents: int, count: int) -> 
                 json=payload,
                 timeout=15,
             )
-            logger.info(f"Order response {r.status_code}: {r.text[:300]}")
+            logger.info(f"Order response {r.status_code}: {r.text[:500]}")
             if r.status_code in (200, 201):
-                return {"success": True, "order": r.json().get("order", {})}
-            return {"success": False, "error": r.text}
+                order = r.json().get("order", {})
+                # Check if the order actually filled
+                fill_count = float(order.get("fill_count_fp", "0"))
+                if fill_count > 0:
+                    logger.info(f"Order FILLED: {fill_count} contracts")
+                    return {"success": True, "filled": True, "order": order, "fill_count": fill_count}
+                else:
+                    logger.warning(f"Order created but NOT FILLED (0 contracts). Likely no liquidity.")
+                    return {"success": True, "filled": False, "order": order, "fill_count": 0}
+            return {"success": False, "filled": False, "error": r.text}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "filled": False, "error": str(e)}
 # ── Tool definitions ──────────────────────────────────────────────────────────
 TOOLS = [
     {
@@ -806,10 +819,12 @@ async def crypto15m_strategy(app, series_ticker: str, state_key: str, coin: str)
                 )
                 result  = place_kalshi_order(ticker, bet_side, price_cents, contracts)
                 chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-                if result["success"]:
+                if result["success"] and result.get("filled"):
+                    # Order was placed AND filled — this is a real trade
+                    actual_fills = int(result.get("fill_count", contracts))
                     state["active_bet_ticker"] = ticker
                     state["active_bet_side"]   = bet_side
-                    state["active_bet_price"]  = price_cents  # Save price for P/L calc later
+                    state["active_bet_price"]  = price_cents
                     save_market_state(state_key, state)
                     # ── LOG TRADE TO DATABASE ──
                     log_trade_to_db(
@@ -817,7 +832,7 @@ async def crypto15m_strategy(app, series_ticker: str, state_key: str, coin: str)
                         coin=coin,
                         side=bet_side,
                         price_cents=price_cents,
-                        contracts=contracts,
+                        contracts=actual_fills,
                         bet_size=bet_dollars,
                         bet_index=state["bet_index"],
                         streak_direction=state["streak_direction"],
@@ -827,19 +842,27 @@ async def crypto15m_strategy(app, series_ticker: str, state_key: str, coin: str)
                         await app.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"🎯 {coin} 15m Reversal Bet!\n\n"
+                                f"🎯 {coin} 15m Reversal Bet FILLED!\n\n"
                                 f"Streak: {state['streak_count']} consecutive {state['streak_direction']}\n"
                                 f"Betting: {bet_side.upper()} on {ticker}\n"
-                                f"Price: {price_cents}¢ | Contracts: {contracts} | ~${bet_dollars:.2f}\n"
+                                f"Price: {price_cents}¢ | Contracts: {actual_fills} | ~${bet_dollars:.2f}\n"
                                 f"Bet #{state['bet_index']+1} of 3"
                             )
                         )
-                else:
-                    logger.error(f"{tag}: order failed — {result['error']}")
+                elif result["success"] and not result.get("filled"):
+                    # Order was created but NOT filled — no liquidity, skip this market
+                    logger.warning(f"{tag}: order not filled on {ticker}, skipping — no liquidity")
                     if chat_id:
                         await app.bot.send_message(
                             chat_id=chat_id,
-                            text=f"⚠️ {coin} 15m: Order failed — {result['error'][:200]}"
+                            text=f"⚠️ {coin} 15m: Order on {ticker} not filled (no liquidity). Skipping, will try next market."
+                        )
+                else:
+                    logger.error(f"{tag}: order failed — {result.get('error', 'unknown')}")
+                    if chat_id:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⚠️ {coin} 15m: Order failed — {result.get('error', 'unknown')[:200]}"
                         )
         except Exception as e:
             logger.error(f"{tag} strategy error: {e}")
