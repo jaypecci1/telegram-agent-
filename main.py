@@ -520,6 +520,92 @@ REASON: [reasoning]"""
             return "\n".join(lines)
         except Exception as e:
             return f"Failed to get trading status: {e}"
+    if name == "get_income_summary":
+        try:
+            res = db.table("jobs").select("*").execute()
+            jobs = res.data or []
+            total_earned   = sum(j.get("cost") or 0 for j in jobs if j.get("paid"))
+            total_owed     = sum(j.get("cost") or 0 for j in jobs if not j.get("paid") and j.get("cost"))
+            by_status = {}
+            for j in jobs:
+                s = j.get("status", "unknown")
+                by_status[s] = by_status.get(s, 0) + 1
+            lines = [
+                f"💰 Income Summary",
+                f"Collected: ${total_earned:.2f}",
+                f"Outstanding (unpaid): ${total_owed:.2f}",
+                f"Total jobs: {len(jobs)}",
+            ]
+            for status, count in sorted(by_status.items()):
+                lines.append(f"  • {status}: {count}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Failed: {e}"
+    if name == "delete_job":
+        try:
+            job_id = inputs["job_id"]
+            res = db.table("jobs").delete().eq("id", job_id).execute()
+            return f"Job {job_id} deleted." if res.data else f"Job {job_id} not found."
+        except Exception as e:
+            return f"Failed: {e}"
+    if name == "search_kalshi_markets":
+        try:
+            status = inputs.get("status", "open")
+            params = {"limit": 20, "status": status}
+            if inputs.get("series"):
+                params["series_ticker"] = inputs["series"]
+            path = "/trade-api/v2/markets"
+            with httpx.Client() as client:
+                r = client.get(f"{KALSHI_BASE_URL}/markets", headers=sign_kalshi_request("GET", path), params=params, timeout=15)
+                if r.status_code != 200:
+                    return f"Kalshi API error: {r.text[:200]}"
+                markets = r.json().get("markets", [])
+            query = (inputs.get("query") or "").lower()
+            if query:
+                markets = [m for m in markets if query in (m.get("title") or "").lower()]
+            if not markets:
+                return "No markets found."
+            lines = []
+            for m in markets[:10]:
+                yes_price = round(float(m.get("yes_ask_dollars") or m.get("last_price_dollars") or 0) * 100)
+                lines.append(f"{m.get('ticker')} — {m.get('title','')[:60]}\n  YES: {yes_price}¢ | Closes: {str(m.get('close_time',''))[:16]}")
+            return f"Found {len(markets)} market(s):\n\n" + "\n\n".join(lines)
+        except Exception as e:
+            return f"Failed: {e}"
+    if name == "get_daily_summary":
+        try:
+            parts = []
+            # Jobs
+            jobs = db.table("jobs").select("*").execute().data or []
+            pending = [j for j in jobs if j.get("status") in ("pending", "in_progress", "waiting_parts")]
+            unpaid  = [j for j in jobs if not j.get("paid") and j.get("cost")]
+            owed    = sum(j.get("cost") or 0 for j in unpaid)
+            parts.append(f"🔧 Jobs: {len(pending)} active | ${owed:.2f} outstanding from {len(unpaid)} unpaid")
+            # Today's trades
+            from datetime import date
+            today = date.today().isoformat()
+            trades = db.table("trades").select("*").gte("created_at", today).execute().data or []
+            day_pl = sum(t.get("profit_loss") or 0 for t in trades)
+            parts.append(f"📈 Today's trades: {len(trades)} | P/L: ${day_pl:.2f}")
+            # Balance
+            bal = get_kalshi_balance()
+            if bal["success"]:
+                parts.append(f"💵 Kalshi balance: ${bal['balance']:.2f}")
+            # Trading status summary
+            statuses = []
+            for _, state_key, coin in CRYPTO_MARKETS:
+                s = get_market_state(state_key)
+                phase = s.get("phase", "watching")
+                if phase == "betting":
+                    statuses.append(f"{coin} betting")
+                elif phase == "cooldown":
+                    statuses.append(f"{coin} cooling down")
+                else:
+                    statuses.append(f"{coin} watching ({s.get('streak_count',0)} streak)")
+            parts.append("📊 " + " | ".join(statuses))
+            return "\n".join(parts)
+        except Exception as e:
+            return f"Failed: {e}"
     return f"Unknown tool: {name}"
 # ── Conversation helpers ───────────────────────────────────────────────────────
 def get_history(limit: int = 20) -> list:
@@ -533,6 +619,35 @@ def save_message(role: str, content: str):
         db.table("conversations").insert({"role": role, "content": content}).execute()
     except Exception as e:
         logger.error(f"Could not save message: {e}")
+def get_live_context() -> str:
+    """Build a brief live-context snippet injected into every Claude call."""
+    lines = []
+    try:
+        jobs = db.table("jobs").select("*").execute().data or []
+        active = [j for j in jobs if j.get("status") in ("pending", "in_progress", "waiting_parts")]
+        unpaid = [j for j in jobs if not j.get("paid") and j.get("cost")]
+        owed   = sum(j.get("cost") or 0 for j in unpaid)
+        if active:
+            lines.append(f"Active jobs ({len(active)}): " + ", ".join(
+                f"#{j['id']} {j['customer_name']} – {j['job_description'][:40]}" for j in active[:5]
+            ))
+        if unpaid:
+            lines.append(f"Unpaid: {len(unpaid)} job(s) totalling ${owed:.2f}")
+    except Exception:
+        pass
+    try:
+        for _, state_key, coin in CRYPTO_MARKETS:
+            s = get_market_state(state_key)
+            phase = s.get("phase", "watching")
+            if phase == "betting":
+                lines.append(f"{coin} trading: active bet on {s.get('active_bet_ticker')} ({s.get('active_bet_side','').upper()})")
+            elif phase == "cooldown":
+                lines.append(f"{coin} trading: in cooldown until {str(s.get('cooldown_until',''))[:16]} UTC")
+    except Exception:
+        pass
+    if not lines:
+        return ""
+    return "LIVE CONTEXT:\n" + "\n".join(lines)
 # ── Claude agent loop ─────────────────────────────────────────────────────────
 async def run_claude(user_text: str, extra_system: str = "") -> str:
     history  = get_history(limit=20)
@@ -540,6 +655,9 @@ async def run_claude(user_text: str, extra_system: str = "") -> str:
         history = history[:-1]
     messages = history + [{"role": "user", "content": user_text}]
     system   = SYSTEM_PROMPT.format(datetime=datetime.now().strftime("%A, %B %d, %Y at %I:%M %p"))
+    live_ctx = get_live_context()
+    if live_ctx:
+        system += f"\n\n{live_ctx}"
     if extra_system:
         system += f"\n\n{extra_system}"
     for _ in range(10):
@@ -930,6 +1048,68 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_message("assistant", final)
     for i in range(0, max(len(final), 1), 4096):
         await update.message.reply_text(final[i : i + 4096])
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Let Jay send a photo and ask a question about it (car damage, parts, etc.)."""
+    try:
+        os.environ["TELEGRAM_CHAT_ID"] = str(update.effective_chat.id)
+    except:
+        pass
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    caption = update.message.caption or "What do you see in this image? Give me useful details."
+    photo   = update.message.photo[-1]  # highest resolution
+    file    = await context.bot.get_file(photo.file_id)
+    photo_bytes = await file.download_as_bytearray()
+    import base64 as _b64
+    img_b64 = _b64.b64encode(photo_bytes).decode()
+    system  = SYSTEM_PROMPT.format(datetime=datetime.now().strftime("%A, %B %d, %Y at %I:%M %p"))
+    live_ctx = get_live_context()
+    if live_ctx:
+        system += f"\n\n{live_ctx}"
+    response = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=system,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text",  "text": caption},
+            ],
+        }],
+    )
+    reply = "".join(b.text for b in response.content if hasattr(b, "text"))
+    save_message("user", f"[Photo] {caption}")
+    save_message("assistant", reply)
+    await update.message.reply_text(reply)
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    result = run_tool("get_trading_status", {})
+    await update.message.reply_text(result)
+async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    result = run_tool("list_jobs", {"status": "pending"}) + "\n\n" + run_tool("list_jobs", {"status": "in_progress"})
+    await update.message.reply_text(result[:4096])
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    result = run_tool("get_kalshi_balance", {})
+    await update.message.reply_text(result)
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hey Jay! Here's what I can do:\n\n"
+        "Quick commands:\n"
+        "  /status — trading status for BTC, ETH, SOL\n"
+        "  /jobs — your active mechanic jobs\n"
+        "  /balance — Kalshi account balance\n"
+        "  /help — this message\n\n"
+        "Just chat with me to:\n"
+        "  • Add, update, or look up mechanic jobs\n"
+        "  • Track payments and parts\n"
+        "  • Search the web\n"
+        "  • Check trade history or income summary\n"
+        "  • Browse Kalshi markets\n"
+        "  • Send a photo and ask me about it\n\n"
+        "Say 'pause trading' or 'resume trading' to control the strategy."
+    )
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         os.environ["TELEGRAM_CHAT_ID"] = str(update.effective_chat.id)
@@ -938,12 +1118,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hey Jay! I'm Pecci, your personal assistant. I can track your mechanic jobs, "
         "search the web, remember everything we talk about, monitor Kalshi markets, and help you trade. "
-        "What do you need?"
+        "What do you need? Type /help to see everything I can do."
     )
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("jobs",    cmd_jobs))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot is running...")
     async with app:
