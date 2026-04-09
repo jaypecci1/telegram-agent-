@@ -298,6 +298,39 @@ TOOLS = [
         "description": "Get the current live trading status for all crypto markets — shows streak count, direction, phase (watching/betting/cooldown), and active bet info for BTC, ETH, and SOL",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "get_income_summary",
+        "description": "Get a summary of Jay's mechanic income — total earned, total owed by customers, and a breakdown by status",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "delete_job",
+        "description": "Permanently delete a mechanic job by its ID",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer", "description": "The ID of the job to delete"}
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "search_kalshi_markets",
+        "description": "Search and browse available Kalshi markets. Use this to find markets to potentially trade on.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":  {"type": "string", "description": "Keyword to filter market titles (optional)"},
+                "series": {"type": "string", "description": "Series ticker to filter by, e.g. KXBTC15M (optional)"},
+                "status": {"type": "string", "description": "open, closed, or settled (default: open)"},
+            },
+        },
+    },
+    {
+        "name": "get_daily_summary",
+        "description": "Get a comprehensive daily brief: pending/unpaid jobs, today's trading P/L, Kalshi balance, and any active positions",
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 # ── Tool execution ────────────────────────────────────────────────────────────
 def run_tool(name: str, inputs: dict) -> str:
@@ -357,8 +390,13 @@ def run_tool(name: str, inputs: dict) -> str:
             return f"Failed: {e}"
     if name == "save_memory":
         try:
-            db.table("memory").insert({"key": inputs["key"], "value": inputs["value"]}).execute()
-            return f"Got it: {inputs['key']} — {inputs['value']}"
+            existing = db.table("memory").select("id").eq("key", inputs["key"]).execute()
+            if existing.data:
+                db.table("memory").update({"value": inputs["value"]}).eq("key", inputs["key"]).execute()
+                return f"Updated memory: {inputs['key']} — {inputs['value']}"
+            else:
+                db.table("memory").insert({"key": inputs["key"], "value": inputs["value"]}).execute()
+                return f"Saved: {inputs['key']} — {inputs['value']}"
         except Exception as e:
             return f"Failed: {e}"
     if name == "recall_memory":
@@ -531,11 +569,12 @@ def _default_state() -> dict:
         "streak_direction": None,     # "UP" | "DOWN" | None
         "streak_count": 0,
         "last_processed_ticker": None,
-        "bet_index": 0,               # 0=$2, 1=$4, 2=$10
+        "bet_index": 0,               # 0=$10, 1=$20, 2=$40
         "consecutive_losses": 0,
         "cooldown_until": None,       # ISO timestamp string
         "active_bet_ticker": None,
         "active_bet_side": None,
+        "active_bet_price": None,
     }
 def get_market_state(state_key: str) -> dict:
     """Load strategy state for a given market from Supabase."""
