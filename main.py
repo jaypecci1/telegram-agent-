@@ -34,17 +34,14 @@ db     = create_client(SUPABASE_URL, SUPABASE_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 # ── Trading Config ────────────────────────────────────────────────────────────
 KALSHI_BASE_URL         = "https://api.elections.kalshi.com/trade-api/v2"
-BET_SIZES               = [10.00, 20.00, 40.00]   # Martingale sequence ($)
-STREAK_REQUIRED         = 5                       # Consecutive same-direction to trigger
-COOLDOWN_MINUTES        = 60                      # Pause after 3 straight losses
-CHECK_INTERVAL          = 60                      # Check every 60 seconds
+CHECK_INTERVAL          = 300                     # Scan markets every 5 minutes
+SMART_TRADE_INTERVAL    = 300                     # How often to scan for opportunities
+MIN_EDGE                = 10                      # Minimum edge % to consider a trade
+MIN_CONFIDENCE          = 55                      # Minimum confidence % to trade
+BASE_BET                = 5.00                    # Base bet size in dollars
+MAX_BET                 = 25.00                   # Maximum bet size
+MAX_OPEN_TRADES         = 3                       # Max simultaneous open positions
 TRADING_PAUSED          = False                   # Can be toggled via Telegram command
-# Markets to run the strategy on: (series_ticker, state_key, display_name)
-CRYPTO_MARKETS = [
-    ("KXBTC15M",  "btc15m_state",  "BTC"),
-    ("KXETH15M",  "eth15m_state",  "ETH"),
-    ("KXSOL15M",  "sol15m_state",  "SOL"),
-]
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are Pecci, Jay's personal AI assistant. Jay is a young adult who works as an automotive and light diesel mechanic doing side jobs, and he is studying Economics at Texas Tech University. His long-term goal is to open his own mechanic shop. He also trades on Kalshi prediction markets.
 You help Jay with:
@@ -52,16 +49,32 @@ You help Jay with:
 - Searching the web for any question he has
 - Remembering important information from all past conversations
 - Managing his day-to-day life as a young adult
-- Monitoring and trading on Kalshi prediction markets
-Trading strategy: You run an autonomous 15-minute mean-reversion + martingale strategy on three Kalshi crypto markets simultaneously: BTC (KXBTC15M), ETH (KXETH15M), and SOL (KXSOL15M). For each coin independently, you watch for 5 consecutive UP or DOWN results, then bet the reversal on the next open market. Bet sizes are $10 → $20 → $40. If all three bets lose, you pause that coin for 1 hour and reset. Any win resets that coin's cycle. You notify Jay automatically when bets are placed, won, or lost.
-IMPORTANT: When Jay asks about streaks, trading status, what phase any coin is in, or anything related to the current state of trading, you MUST ALWAYS call the get_trading_status tool. NEVER estimate or guess streak numbers. The real data is stored in the database — use the tool to fetch it.
-IMPORTANT: When Jay asks about trade history or past trades, ALWAYS call the get_trade_history tool. All trades placed by the background strategy are logged in the database with full details including outcome and profit/loss.
+- Autonomously trading on Kalshi prediction markets with a smart AI strategy
+
+Trading strategy: You run a fully autonomous smart trading bot that scans ALL open Kalshi markets every 5 minutes. For each market, you:
+1. Research it with 2-3 web searches to gather real data, news, and relevant context
+2. Estimate the TRUE probability of YES resolving based on that research
+3. Compare your estimate to the market price to calculate your edge
+4. Only place trades with edge > 10% AND confidence > 55%
+5. Bet size scales with confidence: low confidence = $5, high confidence = up to $25
+6. After every settlement, you generate a lesson from the outcome and store it
+7. Before analyzing any new market, you retrieve past lessons from the same category
+8. You track win rates by category and avoid categories where you consistently lose
+
+This strategy learns and improves with every trade. It builds a memory of what works.
+
+IMPORTANT: When Jay asks about trading status, ALWAYS call the get_trading_status tool.
+IMPORTANT: When Jay asks about trade history, ALWAYS call the get_trade_history tool.
+IMPORTANT: When Jay asks what the bot has learned, ALWAYS call the get_trading_lessons tool.
+
 Telegram trading commands Jay can use:
 - "pause trading" - stop all new trades
 - "resume trading" - resume trading
 - "show my positions" - list open Kalshi positions
 - "show my balance" - check Kalshi balance
 - "show trade history" - view past trades
+- "what have you learned" - show lessons from past trades
+
 Personality: Be conversational and friendly. Talk to Jay like a smart assistant who actually knows him. Keep responses clear and to the point.
 Current date and time: {datetime}"""
 # ── Kalshi API helpers ────────────────────────────────────────────────────────
@@ -295,8 +308,19 @@ TOOLS = [
     },
     {
         "name": "get_trading_status",
-        "description": "Get the current live trading status for all crypto markets — shows streak count, direction, phase (watching/betting/cooldown), and active bet info for BTC, ETH, and SOL",
+        "description": "Get the current live trading status — shows open trades, recent analyses, win rates by category, and whether trading is paused",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_trading_lessons",
+        "description": "Get lessons the bot has learned from past trades — what worked, what didn't, and win rates by market category",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "Filter lessons by category (optional)"},
+                "limit":    {"type": "integer", "description": "How many lessons to show, default 10"},
+            },
+        },
     },
     {
         "name": "get_income_summary",
@@ -494,32 +518,57 @@ REASON: [reasoning]"""
         return f"Trade failed: {result['error']}"
     if name == "get_trading_status":
         try:
-            lines = [f"📊 Live Trading Status ({STREAK_REQUIRED}-streak trigger)\n"]
-            for series_ticker, state_key, coin in CRYPTO_MARKETS:
-                s = get_market_state(state_key)
-                phase = s.get("phase", "watching")
-                streak_dir   = s.get("streak_direction") or "—"
-                streak_count = s.get("streak_count", 0)
-                bet_index    = s.get("bet_index", 0)
-                losses       = s.get("consecutive_losses", 0)
-                active       = s.get("active_bet_ticker")
-                active_side  = s.get("active_bet_side")
-                cooldown     = s.get("cooldown_until", "")
-                if phase == "watching":
-                    status = f"👀 Watching — {streak_count} consecutive {streak_dir}"
-                elif phase == "betting":
-                    if active:
-                        status = f"🎯 Bet active on {active} ({active_side.upper()}) — ${BET_SIZES[bet_index]:.2f} (bet #{bet_index+1})"
-                    else:
-                        status = f"🎯 Betting mode — waiting for next open market (bet #{bet_index+1})"
-                elif phase == "cooldown":
-                    status = f"⏸ Cooldown until ~{cooldown[:16]} UTC"
-                else:
-                    status = phase
-                lines.append(f"{'₿' if coin=='BTC' else '⟠' if coin=='ETH' else '◎'} {coin}: {status}")
+            lines = ["📊 Smart Trading Status\n"]
+            lines.append(f"Bot: {'⏸ PAUSED' if TRADING_PAUSED else '🟢 ACTIVE'}")
+            # Open trades
+            open_trades = db.table("trades").select("*").eq("status", "open").execute().data or []
+            if open_trades:
+                lines.append(f"\nOpen positions ({len(open_trades)}):")
+                for t in open_trades:
+                    lines.append(f"  • {t.get('market_ticker')} — {t.get('side','').upper()} @ {t.get('price_cents',0)}¢ | ${t.get('estimated_cost',0):.2f}")
+            else:
+                lines.append("\nNo open positions.")
+            # Category stats
+            stats = db.table("category_stats").select("*").order("total_trades", desc=True).limit(5).execute().data or []
+            if stats:
+                lines.append("\nWin rates by category:")
+                for s in stats:
+                    wr = round(s["wins"] / s["total_trades"] * 100) if s["total_trades"] > 0 else 0
+                    lines.append(f"  • {s['category']}: {wr}% ({s['wins']}/{s['total_trades']}) | P/L: ${s['total_pl']:.2f}")
+            # Recent analysis
+            recent = db.table("market_analyses").select("*").order("created_at", desc=True).limit(3).execute().data or []
+            if recent:
+                lines.append("\nLast 3 markets analyzed:")
+                for a in recent:
+                    traded = "✅ traded" if a.get("trade_placed") else "⏭ skipped"
+                    lines.append(f"  • {a.get('title','')[:50]} | edge={a.get('edge',0)}% | {traded}")
             return "\n".join(lines)
         except Exception as e:
             return f"Failed to get trading status: {e}"
+    if name == "get_trading_lessons":
+        try:
+            limit = inputs.get("limit", 10)
+            q = db.table("trading_lessons").select("*").order("created_at", desc=True)
+            if inputs.get("category"):
+                q = q.eq("category", inputs["category"])
+            lessons = q.limit(limit).execute().data or []
+            if not lessons:
+                return "No lessons learned yet — the bot needs to make some trades first."
+            stats = db.table("category_stats").select("*").order("total_trades", desc=True).execute().data or []
+            lines = ["📚 What I've learned from past trades:\n"]
+            if stats:
+                lines.append("Win rates by category:")
+                for s in stats:
+                    wr = round(s["wins"] / s["total_trades"] * 100) if s["total_trades"] > 0 else 0
+                    lines.append(f"  {s['category']}: {wr}% win rate | avg edge: {s['avg_edge']:.1f}% | P/L: ${s['total_pl']:.2f}")
+                lines.append("")
+            lines.append("Recent lessons:")
+            for l in lessons:
+                icon = "✅" if l.get("was_correct") else "❌"
+                lines.append(f"{icon} [{l.get('category','?')}] {l.get('lesson','')}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Failed: {e}"
     if name == "get_income_summary":
         try:
             res = db.table("jobs").select("*").execute()
@@ -592,17 +641,8 @@ REASON: [reasoning]"""
             if bal["success"]:
                 parts.append(f"💵 Kalshi balance: ${bal['balance']:.2f}")
             # Trading status summary
-            statuses = []
-            for _, state_key, coin in CRYPTO_MARKETS:
-                s = get_market_state(state_key)
-                phase = s.get("phase", "watching")
-                if phase == "betting":
-                    statuses.append(f"{coin} betting")
-                elif phase == "cooldown":
-                    statuses.append(f"{coin} cooling down")
-                else:
-                    statuses.append(f"{coin} watching ({s.get('streak_count',0)} streak)")
-            parts.append("📊 " + " | ".join(statuses))
+            open_t = db.table("trades").select("id").eq("status", "open").execute().data or []
+            parts.append(f"📊 Smart trader: {'⏸ paused' if TRADING_PAUSED else '🟢 active'} | {len(open_t)} open position(s)")
             return "\n".join(parts)
         except Exception as e:
             return f"Failed: {e}"
@@ -636,13 +676,9 @@ def get_live_context() -> str:
     except Exception:
         pass
     try:
-        for _, state_key, coin in CRYPTO_MARKETS:
-            s = get_market_state(state_key)
-            phase = s.get("phase", "watching")
-            if phase == "betting":
-                lines.append(f"{coin} trading: active bet on {s.get('active_bet_ticker')} ({s.get('active_bet_side','').upper()})")
-            elif phase == "cooldown":
-                lines.append(f"{coin} trading: in cooldown until {str(s.get('cooldown_until',''))[:16]} UTC")
+        open_trades = db.table("trades").select("market_ticker,side").eq("status", "open").execute().data or []
+        if open_trades:
+            lines.append("Open trades: " + ", ".join(f"{t['market_ticker']} {t['side'].upper()}" for t in open_trades[:3]))
     except Exception:
         pass
     if not lines:
@@ -679,41 +715,8 @@ async def run_claude(user_text: str, extra_system: str = "") -> str:
         else:
             return "".join(b.text for b in response.content if hasattr(b, "text"))
     return "I got stuck in a loop — try again."
-# ── Crypto 15m strategy helpers ───────────────────────────────────────────────
+# ── Smart trader helpers ──────────────────────────────────────────────────────
 import json as _json
-def _default_state() -> dict:
-    return {
-        "phase": "watching",          # watching | betting | cooldown
-        "streak_direction": None,     # "UP" | "DOWN" | None
-        "streak_count": 0,
-        "last_processed_ticker": None,
-        "bet_index": 0,               # 0=$10, 1=$20, 2=$40
-        "consecutive_losses": 0,
-        "cooldown_until": None,       # ISO timestamp string
-        "active_bet_ticker": None,
-        "active_bet_side": None,
-        "active_bet_price": None,
-    }
-def get_market_state(state_key: str) -> dict:
-    """Load strategy state for a given market from Supabase."""
-    try:
-        res = db.table("memory").select("*").eq("key", state_key).execute()
-        if res.data:
-            return _json.loads(res.data[0]["value"])
-    except Exception as e:
-        logger.warning(f"Could not load {state_key}: {e}")
-    return _default_state()
-def save_market_state(state_key: str, state: dict):
-    """Persist strategy state for a given market to Supabase."""
-    try:
-        val      = _json.dumps(state)
-        existing = db.table("memory").select("id").eq("key", state_key).execute()
-        if existing.data:
-            db.table("memory").update({"value": val}).eq("key", state_key).execute()
-        else:
-            db.table("memory").insert({"key": state_key, "value": val}).execute()
-    except Exception as e:
-        logger.error(f"Failed to save {state_key}: {e}")
 def get_settled_markets(series_ticker: str, limit: int = 25) -> list:
     """Fetch recently settled markets for a series, sorted oldest→newest."""
     try:
@@ -752,278 +755,407 @@ def get_open_market(series_ticker: str) -> dict:
     except Exception as e:
         logger.error(f"get_open_market({series_ticker}) error: {e}")
     return {}
-# ── Trade logging helper ──────────────────────────────────────────────────────
-def log_trade_to_db(ticker: str, coin: str, side: str, price_cents: int,
-                    contracts: int, bet_size: float, bet_index: int,
-                    streak_direction: str, streak_count: int):
-    """Save a trade placed by the background strategy to the trades table."""
+# ── Smart trading helpers ─────────────────────────────────────────────────────
+def fetch_open_markets(limit: int = 50) -> list:
+    """Fetch open Kalshi markets across all series."""
     try:
-        db.table("trades").insert({
-            "market_ticker": ticker,
-            "market_title": f"{coin} 15m Reversal Bet #{bet_index + 1}",
-            "side": side,
-            "price_cents": price_cents,
-            "contracts": contracts,
-            "estimated_cost": round((price_cents / 100) * contracts, 2),
-            "status": "open",
-            "profit_loss": 0,
-            "strategy": f"{coin}_15m_martingale",
-            "streak_direction": streak_direction,
-            "streak_count": streak_count,
-        }).execute()
-        logger.info(f"Trade logged to DB: {ticker} {side} ${bet_size:.2f}")
+        path = "/trade-api/v2/markets"
+        with httpx.Client() as client:
+            r = client.get(
+                f"{KALSHI_BASE_URL}/markets",
+                headers=sign_kalshi_request("GET", path),
+                params={"limit": limit, "status": "open"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                return r.json().get("markets", [])
     except Exception as e:
-        logger.error(f"Failed to log trade to DB: {e}")
+        logger.error(f"fetch_open_markets error: {e}")
+    return []
+
+def fetch_settled_market(ticker: str) -> dict:
+    """Fetch a single settled market by ticker."""
+    try:
+        path = f"/trade-api/v2/markets/{ticker}"
+        with httpx.Client() as client:
+            r = client.get(f"{KALSHI_BASE_URL}/markets/{ticker}",
+                           headers=sign_kalshi_request("GET", path), timeout=10)
+            if r.status_code == 200:
+                return r.json().get("market", {})
+    except Exception as e:
+        logger.error(f"fetch_settled_market({ticker}) error: {e}")
+    return {}
+
+def get_past_lessons(category: str, limit: int = 5) -> str:
+    """Retrieve past lessons for a category to inform current analysis."""
+    try:
+        lessons = db.table("trading_lessons").select("*") \
+            .eq("category", category).order("created_at", desc=True).limit(limit).execute().data or []
+        stats = db.table("category_stats").select("*").eq("category", category).execute().data
+        if not lessons and not stats:
+            return ""
+        lines = [f"Past experience in '{category}':"]
+        if stats:
+            s = stats[0]
+            wr = round(s["wins"] / s["total_trades"] * 100) if s["total_trades"] > 0 else 0
+            lines.append(f"  Win rate: {wr}% ({s['wins']}/{s['total_trades']}) | Avg edge: {s['avg_edge']:.1f}% | P/L: ${s['total_pl']:.2f}")
+        for l in lessons:
+            icon = "✅" if l.get("was_correct") else "❌"
+            lines.append(f"  {icon} {l['lesson']}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"get_past_lessons error: {e}")
+        return ""
+
+def categorize_market(title: str, ticker: str) -> str:
+    """Categorize a market based on its title/ticker."""
+    title_lower = title.lower()
+    ticker_upper = ticker.upper()
+    if any(w in title_lower for w in ["btc", "bitcoin", "eth", "ethereum", "sol", "solana", "crypto"]):
+        return "crypto"
+    if any(w in title_lower for w in ["fed", "rate", "cpi", "inflation", "gdp", "unemployment", "jobs"]):
+        return "economics"
+    if any(w in title_lower for w in ["president", "congress", "senate", "election", "vote", "trump", "biden", "harris"]):
+        return "politics"
+    if any(w in title_lower for w in ["nfl", "nba", "mlb", "nhl", "soccer", "sport", "game", "super bowl"]):
+        return "sports"
+    if any(w in title_lower for w in ["stock", "s&p", "nasdaq", "dow", "market"]):
+        return "stocks"
+    if any(w in title_lower for w in ["weather", "temperature", "rain", "snow", "hurricane"]):
+        return "weather"
+    return "other"
+
+def analyze_market_with_claude(market: dict) -> dict:
+    """
+    Core intelligence: research a market, estimate true probability, decide if worth trading.
+    Returns dict with: predicted_prob, edge, confidence, bet, reasoning, category
+    """
+    ticker    = market.get("ticker", "")
+    title     = market.get("title", "")
+    yes_price = round(float(market.get("yes_ask_dollars") or market.get("last_price_dollars") or 0.5) * 100)
+    category  = categorize_market(title, ticker)
+
+    # Skip markets expiring in under 30 minutes (not enough time to act)
+    close_time = market.get("close_time", "")
+    try:
+        from datetime import timezone, timedelta
+        close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+        mins_left = (close_dt - datetime.now(timezone.utc)).total_seconds() / 60
+        if mins_left < 30:
+            return {"bet": "SKIP", "reasoning": "Market closes too soon"}
+    except Exception:
+        pass
+
+    # Do 2 web searches
+    try:
+        r1 = tavily.search(f"{title} prediction odds probability", max_results=3)
+        research1 = "\n".join(f"{x['title']}: {x['content'][:300]}" for x in r1.get("results", []))
+        r2 = tavily.search(f"{title} latest news 2025", max_results=3)
+        research2 = "\n".join(f"{x['title']}: {x['content'][:300]}" for x in r2.get("results", []))
+        web_research = research1 + "\n\n" + research2
+    except Exception as e:
+        web_research = f"Web search failed: {e}"
+
+    # Get past lessons for this category
+    past_lessons = get_past_lessons(category)
+
+    # Ask Claude to analyze
+    prompt = f"""You are a sharp prediction market analyst with a track record of finding edges.
+
+Market: {title}
+Ticker: {ticker}
+Category: {category}
+Current YES price: {yes_price}¢ ({yes_price}% implied probability)
+Time to close: {int(mins_left) if 'mins_left' in dir() else '?'} minutes
+
+{f'--- PAST EXPERIENCE ---{chr(10)}{past_lessons}{chr(10)}' if past_lessons else ''}
+--- WEB RESEARCH ---
+{web_research[:3000]}
+
+Based on all of this:
+1. What is your estimated TRUE probability YES resolves? (0-100)
+2. What edge do you have? (your estimate minus current price, can be negative)
+3. Should you bet YES, NO, or SKIP?
+4. Confidence in your estimate (0-100)?
+5. Brief reasoning (2-3 sentences max)
+
+Rules:
+- Only recommend YES or NO if |edge| > 10 AND confidence > 55
+- Otherwise SKIP
+- If past experience shows consistent losses in this category, be more conservative
+- Be honest about uncertainty
+
+Respond in EXACTLY this format (no other text):
+TRUE_PROB: [number]
+EDGE: [number]
+BET: [YES/NO/SKIP]
+CONFIDENCE: [number]
+REASON: [reasoning]"""
+
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.content[0].text.strip()
+        lines = {l.split(":")[0].strip(): ":".join(l.split(":")[1:]).strip()
+                 for l in text.split("\n") if ":" in l}
+        return {
+            "ticker":        ticker,
+            "title":         title,
+            "category":      category,
+            "yes_price":     yes_price,
+            "predicted_prob": int(lines.get("TRUE_PROB", 50)),
+            "edge":          int(lines.get("EDGE", 0)),
+            "bet":           lines.get("BET", "SKIP").upper(),
+            "confidence":    int(lines.get("CONFIDENCE", 0)),
+            "reasoning":     lines.get("REASON", ""),
+            "web_research":  web_research[:2000],
+        }
+    except Exception as e:
+        logger.error(f"Claude analysis failed for {ticker}: {e}")
+        return {"bet": "SKIP", "reasoning": str(e)}
+
+def log_analysis(analysis: dict, trade_placed: bool, trade_side: str = None):
+    """Save market analysis to DB."""
+    try:
+        db.table("market_analyses").insert({
+            "ticker":         analysis.get("ticker"),
+            "title":          analysis.get("title"),
+            "category":       analysis.get("category"),
+            "predicted_prob": analysis.get("predicted_prob"),
+            "market_price":   analysis.get("yes_price"),
+            "edge":           analysis.get("edge"),
+            "confidence":     analysis.get("confidence"),
+            "reasoning":      analysis.get("reasoning"),
+            "web_research":   analysis.get("web_research", "")[:2000],
+            "trade_placed":   trade_placed,
+            "trade_side":     trade_side,
+        }).execute()
+    except Exception as e:
+        logger.error(f"log_analysis error: {e}")
 
 def update_trade_result(ticker: str, status: str, profit_loss: float):
-    """Update a trade's outcome (won/lost) in the trades table."""
+    """Update a trade's outcome in the trades table."""
     try:
         db.table("trades").update({
             "status": status,
             "profit_loss": round(profit_loss, 2),
         }).eq("market_ticker", ticker).eq("status", "open").execute()
-        logger.info(f"Trade updated: {ticker} → {status} (P/L: ${profit_loss:.2f})")
     except Exception as e:
-        logger.error(f"Failed to update trade result: {e}")
-# ── Generic crypto 15m mean-reversion + martingale strategy ───────────────────
-async def crypto15m_strategy(app, series_ticker: str, state_key: str, coin: str):
+        logger.error(f"update_trade_result error: {e}")
+
+def save_lesson(ticker: str, category: str, lesson: str, outcome: str, was_correct: bool):
+    """Save a lesson learned from a settled trade."""
+    try:
+        db.table("trading_lessons").insert({
+            "ticker":      ticker,
+            "category":    category,
+            "lesson":      lesson,
+            "outcome":     outcome,
+            "was_correct": was_correct,
+        }).execute()
+    except Exception as e:
+        logger.error(f"save_lesson error: {e}")
+
+def update_category_stats(category: str, won: bool, edge: float, pl: float):
+    """Update running win rate stats for a category."""
+    try:
+        existing = db.table("category_stats").select("*").eq("category", category).execute().data
+        if existing:
+            s = existing[0]
+            new_total  = s["total_trades"] + 1
+            new_wins   = s["wins"] + (1 if won else 0)
+            new_pl     = s["total_pl"] + pl
+            new_avg_edge = (s["avg_edge"] * s["total_trades"] + edge) / new_total
+            db.table("category_stats").update({
+                "total_trades": new_total,
+                "wins":         new_wins,
+                "total_pl":     round(new_pl, 2),
+                "avg_edge":     round(new_avg_edge, 1),
+                "updated_at":   datetime.utcnow().isoformat(),
+            }).eq("category", category).execute()
+        else:
+            db.table("category_stats").insert({
+                "category":     category,
+                "total_trades": 1,
+                "wins":         1 if won else 0,
+                "total_pl":     round(pl, 2),
+                "avg_edge":     round(edge, 1),
+            }).execute()
+    except Exception as e:
+        logger.error(f"update_category_stats error: {e}")
+
+# ── Smart trading loop ────────────────────────────────────────────────────────
+async def smart_trader_loop(app):
     """
-    Mean-reversion + capped martingale for any Kalshi crypto 15-min series.
-    - Watches for STREAK_REQUIRED consecutive UP or DOWN results
-    - Bets the reversal on the next open market
-    - Martingale: $2 → $4 → $10
-    - 3 straight losses → 1-hour cooldown, then reset
-    - Any win → full reset back to watching
+    Main AI trading loop. Every 5 minutes:
+    1. Scan all open Kalshi markets
+    2. Research each one with web search
+    3. Ask Claude for edge estimate
+    4. Trade if edge > MIN_EDGE and confidence > MIN_CONFIDENCE
+    5. Check settled trades for outcomes and generate lessons
     """
     global TRADING_PAUSED
-    await asyncio.sleep(30)
-    logger.info(f"{coin} 15m strategy started.")
+    await asyncio.sleep(60)  # Wait for bot to fully start
+    logger.info("Smart trader loop started.")
+
     while True:
         try:
-            if TRADING_PAUSED or not KALSHI_API_KEY:
-                await asyncio.sleep(CHECK_INTERVAL)
+            if not KALSHI_API_KEY:
+                await asyncio.sleep(SMART_TRADE_INTERVAL)
                 continue
-            state   = get_market_state(state_key)
-            now_str = datetime.utcnow().isoformat()
-            tag     = f"{coin}15m"
-            # ── 1. Cooldown check ──────────────────────────────────────────────
-            if state["phase"] == "cooldown":
-                cooldown_until = state.get("cooldown_until") or ""
-                if now_str >= cooldown_until:
-                    logger.info(f"{tag}: cooldown expired. Resuming watch.")
-                    state.update({
-                        "phase": "watching",
-                        "streak_direction": None,
-                        "streak_count": 0,
-                        "bet_index": 0,
-                        "consecutive_losses": 0,
-                        "cooldown_until": None,
-                        "active_bet_ticker": None,
-                        "active_bet_side": None,
-                    })
-                    save_market_state(state_key, state)
-                    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-                    if chat_id:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"⏰ {coin} 15m: Cooldown over. Back to watching for streaks!"
-                        )
-                else:
-                    logger.info(f"{tag}: in cooldown until {cooldown_until}")
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-            # ── 2. Fetch recently settled markets ─────────────────────────────
-            settled = get_settled_markets(series_ticker)
-            if not settled:
-                logger.info(f"{tag}: no settled markets found yet.")
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
-            logger.info(f"{tag}: fetched {len(settled)} settled markets. Phase={state['phase']}")
-            # ── 3. Check if active bet resolved ───────────────────────────────
-            if state["phase"] == "betting" and state.get("active_bet_ticker"):
-                active_ticker = state["active_bet_ticker"]
-                active_side   = state["active_bet_side"]
-                resolved_bet  = next((m for m in settled if m.get("ticker") == active_ticker), None)
-                if resolved_bet:
-                    result_raw = (resolved_bet.get("result") or "").upper()
-                    won        = (result_raw == active_side.upper())
-                    bet_size   = BET_SIZES[state["bet_index"]]
-                    chat_id    = os.environ.get("TELEGRAM_CHAT_ID", "")
-                    if won:
-                        logger.info(f"{tag}: ✅ WON on {active_ticker}! Resetting.")
-                        # ── LOG WIN TO DATABASE ──
-                        payout = round(bet_size * (1 - (state.get("active_bet_price", 50) / 100)), 2)
-                        update_trade_result(active_ticker, "won", payout)
-                        if chat_id:
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"✅ {coin} 15m WIN!\n"
-                                    f"Market: {active_ticker}\n"
-                                    f"Bet: {active_side.upper()} | Size: ${bet_size:.2f}\n\n"
-                                    f"Resetting — back to streak watch."
-                                )
-                            )
-                        state.update({
-                            "phase": "watching",
-                            "streak_direction": None,
-                            "streak_count": 0,
-                            "bet_index": 0,
-                            "consecutive_losses": 0,
-                            "active_bet_ticker": None,
-                            "active_bet_side": None,
-                            "active_bet_price": None,
-                        })
-                    else:
-                        state["consecutive_losses"] += 1
-                        logger.info(f"{tag}: ❌ LOST on {active_ticker}. Losses={state['consecutive_losses']}")
-                        # ── LOG LOSS TO DATABASE ──
-                        update_trade_result(active_ticker, "lost", -bet_size)
-                        if state["consecutive_losses"] >= 3:
-                            from datetime import timedelta
-                            cooldown_until = (
-                                datetime.utcnow() + timedelta(minutes=COOLDOWN_MINUTES)
-                            ).isoformat()
-                            state.update({
-                                "phase": "cooldown",
-                                "cooldown_until": cooldown_until,
-                                "active_bet_ticker": None,
-                                "active_bet_side": None,
-                                "active_bet_price": None,
-                            })
-                            logger.info(f"{tag}: all 3 bets lost. Cooldown until {cooldown_until}")
-                            if chat_id:
-                                await app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=(
-                                        f"❌ {coin} 15m: All 3 bets lost.\n"
-                                        f"Pausing for {COOLDOWN_MINUTES} min "
-                                        f"(until ~{cooldown_until[:16]} UTC)."
-                                    )
-                                )
-                        else:
-                            next_idx = min(state["bet_index"] + 1, 2)
-                            state["bet_index"]        = next_idx
-                            state["active_bet_ticker"] = None
-                            state["active_bet_side"]   = None
-                            state["active_bet_price"]  = None
-                            logger.info(f"{tag}: escalating to bet #{next_idx+1} — ${BET_SIZES[next_idx]:.2f}")
-                            if chat_id:
-                                await app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=(
-                                        f"❌ {coin} 15m LOSS on {active_ticker}.\n"
-                                        f"Escalating to ${BET_SIZES[next_idx]:.2f}..."
-                                    )
-                                )
-                    save_market_state(state_key, state)
-            # ── 4. Update streak (watching phase only) ─────────────────────────
-            if state["phase"] == "watching":
-                last_ticker = state.get("last_processed_ticker")
-                start_idx   = 0
-                if last_ticker:
-                    for i, m in enumerate(settled):
-                        if m.get("ticker") == last_ticker:
-                            start_idx = i + 1
-                            break
-                for m in settled[start_idx:]:
-                    ticker     = m.get("ticker", "")
-                    result_raw = (m.get("result") or "").upper()
-                    if result_raw not in ("YES", "NO"):
+
+            chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+            # ── 1. Check open trades for settlements ──────────────────────────
+            open_trades = db.table("trades").select("*").eq("status", "open").execute().data or []
+            for trade in open_trades:
+                try:
+                    market = fetch_settled_market(trade["market_ticker"])
+                    if not market or market.get("status") != "settled":
                         continue
-                    direction = "UP" if result_raw == "YES" else "DOWN"
-                    if state["streak_direction"] == direction:
-                        state["streak_count"] += 1
-                    else:
-                        state["streak_direction"] = direction
-                        state["streak_count"]     = 1
-                    state["last_processed_ticker"] = ticker
-                    logger.info(
-                        f"{tag}: {ticker} → {direction} | "
-                        f"Streak: {state['streak_count']} consecutive {direction}"
+
+                    result     = (market.get("result") or "").upper()
+                    side       = (trade.get("side") or "").upper()
+                    won        = (result == side)
+                    cost       = trade.get("estimated_cost", 0)
+                    price_c    = trade.get("price_cents", 50)
+                    pl         = round(cost * (100 - price_c) / price_c, 2) if won else -cost
+                    category   = trade.get("strategy", "other")
+
+                    update_trade_result(trade["market_ticker"], "won" if won else "lost", pl)
+
+                    # Generate a lesson with Claude
+                    analysis_row = db.table("market_analyses") \
+                        .select("*").eq("ticker", trade["market_ticker"]).execute().data
+                    reasoning = analysis_row[0]["reasoning"] if analysis_row else "No reasoning stored"
+                    lesson_prompt = f"""A Kalshi trade just settled. Generate one short lesson (1-2 sentences) from this outcome.
+
+Market: {trade.get('market_title', trade['market_ticker'])}
+Category: {category}
+My prediction reasoning: {reasoning}
+I bet: {side}
+Market resolved: {result}
+Result: {'WIN' if won else 'LOSS'} | P/L: ${pl:.2f}
+
+What should I learn or remember for future trades in this category? Be specific and actionable."""
+
+                    lesson_resp = claude.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=150,
+                        messages=[{"role": "user", "content": lesson_prompt}]
                     )
-                if state["streak_count"] >= STREAK_REQUIRED:
-                    logger.info(
-                        f"{tag}: 🎯 streak of {state['streak_count']} {state['streak_direction']}! "
-                        f"Switching to betting mode."
-                    )
-                    state["phase"]              = "betting"
-                    state["bet_index"]          = 0
-                    state["consecutive_losses"] = 0
-                save_market_state(state_key, state)
-            # ── 5. Place bet if in betting mode with no active bet ─────────────
-            if state["phase"] == "betting" and not state.get("active_bet_ticker"):
-                open_market = get_open_market(series_ticker)
-                if not open_market:
-                    logger.info(f"{tag}: no open market available yet.")
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-                ticker   = open_market.get("ticker", "")
-                bet_side = "no" if state["streak_direction"] == "UP" else "yes"
-                yes_ask_d = float(open_market.get("yes_ask_dollars") or 0)
-                last_d    = float(open_market.get("last_price_dollars") or 0)
-                yes_bid_d = float(open_market.get("yes_bid_dollars") or 0)
-                mid_d     = yes_ask_d or last_d or yes_bid_d or 0.50
-                if bet_side == "yes":
-                    price_cents = max(1, min(99, round(mid_d * 100)))
-                else:
-                    price_cents = max(1, min(99, round((1.0 - mid_d) * 100)))
-                bet_dollars = BET_SIZES[state["bet_index"]]
-                contracts   = max(1, int(bet_dollars / (price_cents / 100)))
-                logger.info(
-                    f"{tag}: placing reversal bet — {ticker} | {bet_side.upper()} | "
-                    f"{price_cents}¢ | {contracts} contracts | ${bet_dollars:.2f}"
-                )
-                result  = place_kalshi_order(ticker, bet_side, price_cents, contracts)
-                chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-                if result["success"] and result.get("filled"):
-                    # Order was placed AND filled — this is a real trade
-                    actual_fills = int(result.get("fill_count", contracts))
-                    state["active_bet_ticker"] = ticker
-                    state["active_bet_side"]   = bet_side
-                    state["active_bet_price"]  = price_cents
-                    save_market_state(state_key, state)
-                    # ── LOG TRADE TO DATABASE ──
-                    log_trade_to_db(
-                        ticker=ticker,
-                        coin=coin,
-                        side=bet_side,
-                        price_cents=price_cents,
-                        contracts=actual_fills,
-                        bet_size=bet_dollars,
-                        bet_index=state["bet_index"],
-                        streak_direction=state["streak_direction"],
-                        streak_count=state["streak_count"],
-                    )
+                    lesson = lesson_resp.content[0].text.strip()
+                    save_lesson(trade["market_ticker"], category, lesson, result, won)
+                    update_category_stats(category, won, trade.get("price_cents", 50) - 50, pl)
+
                     if chat_id:
                         await app.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"🎯 {coin} 15m Reversal Bet FILLED!\n\n"
-                                f"Streak: {state['streak_count']} consecutive {state['streak_direction']}\n"
-                                f"Betting: {bet_side.upper()} on {ticker}\n"
-                                f"Price: {price_cents}¢ | Contracts: {actual_fills} | ~${bet_dollars:.2f}\n"
-                                f"Bet #{state['bet_index']+1} of 3"
+                                f"{'✅ WIN' if won else '❌ LOSS'}: {trade.get('market_title', trade['market_ticker'])[:60]}\n"
+                                f"Bet {side} | Result: {result} | P/L: ${pl:+.2f}\n\n"
+                                f"📚 Lesson: {lesson}"
                             )
                         )
-                elif result["success"] and not result.get("filled"):
-                    # Order was created but NOT filled — no liquidity, skip this market
-                    logger.warning(f"{tag}: order not filled on {ticker}, skipping — no liquidity")
-                    if chat_id:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"⚠️ {coin} 15m: Order on {ticker} not filled (no liquidity). Skipping, will try next market."
-                        )
-                else:
-                    logger.error(f"{tag}: order failed — {result.get('error', 'unknown')}")
-                    if chat_id:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"⚠️ {coin} 15m: Order failed — {result.get('error', 'unknown')[:200]}"
-                        )
+                    logger.info(f"Settled: {trade['market_ticker']} → {'won' if won else 'lost'} ${pl:+.2f}")
+                except Exception as e:
+                    logger.error(f"Settlement check error for {trade.get('market_ticker')}: {e}")
+
+            # ── 2. Skip scanning if paused or too many open trades ────────────
+            if TRADING_PAUSED:
+                await asyncio.sleep(SMART_TRADE_INTERVAL)
+                continue
+
+            open_count = len(db.table("trades").select("id").eq("status", "open").execute().data or [])
+            if open_count >= MAX_OPEN_TRADES:
+                logger.info(f"Smart trader: {open_count} open trades, at max. Skipping scan.")
+                await asyncio.sleep(SMART_TRADE_INTERVAL)
+                continue
+
+            # ── 3. Scan open markets ──────────────────────────────────────────
+            markets = fetch_open_markets(limit=30)
+            logger.info(f"Smart trader: scanning {len(markets)} open markets.")
+
+            # Skip tickers we already have open trades on
+            open_tickers = {t["market_ticker"] for t in open_trades}
+
+            for market in markets:
+                ticker = market.get("ticker", "")
+                if ticker in open_tickers:
+                    continue
+                if open_count >= MAX_OPEN_TRADES:
+                    break
+
+                try:
+                    analysis = analyze_market_with_claude(market)
+                    bet      = analysis.get("bet", "SKIP")
+                    edge     = analysis.get("edge", 0)
+                    conf     = analysis.get("confidence", 0)
+                    category = analysis.get("category", "other")
+
+                    if bet == "SKIP" or abs(edge) < MIN_EDGE or conf < MIN_CONFIDENCE:
+                        log_analysis(analysis, trade_placed=False)
+                        logger.info(f"SKIP {ticker}: edge={edge}% conf={conf}%")
+                        continue
+
+                    # Size bet based on confidence
+                    bet_size = BASE_BET + ((conf - MIN_CONFIDENCE) / (100 - MIN_CONFIDENCE)) * (MAX_BET - BASE_BET)
+                    bet_size = round(min(bet_size, MAX_BET), 2)
+                    side     = bet.lower()  # "yes" or "no"
+
+                    yes_price = analysis.get("yes_price", 50)
+                    price_cents = yes_price if side == "yes" else (100 - yes_price)
+                    price_cents = max(1, min(99, price_cents))
+                    contracts   = max(1, int(bet_size / (price_cents / 100)))
+
+                    result = place_kalshi_order(ticker, side, price_cents, contracts)
+
+                    if result["success"] and result.get("filled"):
+                        actual_cost = round((price_cents / 100) * int(result.get("fill_count", contracts)), 2)
+                        db.table("trades").insert({
+                            "market_ticker":  ticker,
+                            "market_title":   analysis.get("title", ticker)[:100],
+                            "side":           side,
+                            "price_cents":    price_cents,
+                            "contracts":      int(result.get("fill_count", contracts)),
+                            "estimated_cost": actual_cost,
+                            "status":         "open",
+                            "profit_loss":    0,
+                            "strategy":       category,
+                        }).execute()
+                        log_analysis(analysis, trade_placed=True, trade_side=side)
+                        open_count += 1
+                        open_tickers.add(ticker)
+
+                        if chat_id:
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"🎯 New Trade Placed!\n\n"
+                                    f"{analysis['title'][:70]}\n"
+                                    f"Bet: {side.upper()} @ {price_cents}¢\n"
+                                    f"Edge: {edge:+d}% | Confidence: {conf}%\n"
+                                    f"Size: ${actual_cost:.2f}\n\n"
+                                    f"Reasoning: {analysis['reasoning']}"
+                                )
+                            )
+                        logger.info(f"TRADE: {ticker} {side.upper()} edge={edge}% conf={conf}% ${actual_cost:.2f}")
+                    else:
+                        log_analysis(analysis, trade_placed=False)
+                        logger.info(f"Order failed/unfilled for {ticker}: {result.get('error','no liquidity')}")
+
+                    await asyncio.sleep(5)  # Throttle between analyses
+
+                except Exception as e:
+                    logger.error(f"Error analyzing {ticker}: {e}")
+
         except Exception as e:
-            logger.error(f"{tag} strategy error: {e}")
-        await asyncio.sleep(CHECK_INTERVAL)
+            logger.error(f"Smart trader loop error: {e}")
+
+        await asyncio.sleep(SMART_TRADE_INTERVAL)
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TRADING_PAUSED
@@ -1135,9 +1267,10 @@ async def main():
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         if KALSHI_API_KEY:
-            for series_ticker, state_key, coin in CRYPTO_MARKETS:
-                asyncio.create_task(crypto15m_strategy(app, series_ticker, state_key, coin))
-            logger.info(f"Started 15m strategies for: {[c for _,_,c in CRYPTO_MARKETS]}")
+            asyncio.create_task(smart_trader_loop(app))
+            logger.info("Smart AI trader started — scanning all Kalshi markets every 5 minutes.")
+        else:
+            logger.warning("No KALSHI_API_KEY — trading disabled.")
         await asyncio.Event().wait()
         await app.updater.stop()
         await app.stop()
