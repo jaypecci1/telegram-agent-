@@ -1051,15 +1051,6 @@ What should I learn or remember for future trades in this category? Be specific 
                     save_lesson(trade["market_ticker"], category, lesson, result, won)
                     update_category_stats(category, won, trade.get("price_cents", 50) - 50, pl)
 
-                    if chat_id:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"{'✅ WIN' if won else '❌ LOSS'}: {trade.get('market_title', trade['market_ticker'])[:60]}\n"
-                                f"Bet {side} | Result: {result} | P/L: ${pl:+.2f}\n\n"
-                                f"📚 Lesson: {lesson}"
-                            )
-                        )
                     logger.info(f"Settled: {trade['market_ticker']} → {'won' if won else 'lost'} ${pl:+.2f}")
                 except Exception as e:
                     logger.error(f"Settlement check error for {trade.get('market_ticker')}: {e}")
@@ -1129,19 +1120,6 @@ What should I learn or remember for future trades in this category? Be specific 
                         log_analysis(analysis, trade_placed=True, trade_side=side)
                         open_count += 1
                         open_tickers.add(ticker)
-
-                        if chat_id:
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"🎯 New Trade Placed!\n\n"
-                                    f"{analysis['title'][:70]}\n"
-                                    f"Bet: {side.upper()} @ {price_cents}¢\n"
-                                    f"Edge: {edge:+d}% | Confidence: {conf}%\n"
-                                    f"Size: ${actual_cost:.2f}\n\n"
-                                    f"Reasoning: {analysis['reasoning']}"
-                                )
-                            )
                         logger.info(f"TRADE: {ticker} {side.upper()} edge={edge}% conf={conf}% ${actual_cost:.2f}")
                     else:
                         log_analysis(analysis, trade_placed=False)
